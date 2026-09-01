@@ -92,7 +92,7 @@ test: ## Run unit tests with the race detector
 	go test -race -count=1 ./...
 
 .PHONY: test-integration
-test-integration: ## Run integration tests (testcontainers)
+test-integration: ## Run integration tests against a live PostgreSQL (make up)
 	go test -race -count=1 -tags=integration ./test/integration/...
 
 .PHONY: cover

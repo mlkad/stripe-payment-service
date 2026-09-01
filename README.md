@@ -109,7 +109,7 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 
 - [x] **Step 1** — infrastructure, Docker stack, database schema
 - [x] **Step 2** — config, logger, pgx pool, server + graceful shutdown
-- [ ] **Step 2b** — domain entities + ports, repositories
-- [ ] **Step 3** — Stripe adapter, Checkout + Customer Portal use cases
-- [ ] **Step 4** — webhook handler: signature verification, claim/dispatch/settle
-- [ ] **Step 5** — integration tests (testcontainers), CI, observability
+- [x] **Step 3** — domain models, repositories, integration tests
+- [ ] **Step 4** — Stripe adapter, Checkout + Customer Portal use cases
+- [ ] **Step 5** — webhook handler: signature verification, claim/dispatch/settle
+- [ ] **Step 6** — CI, observability, deployment
