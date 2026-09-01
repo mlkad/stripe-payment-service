@@ -67,8 +67,12 @@ stripe-payment-service/
 │   │   ├── webhook_service.go      #    verify → claim → dispatch → settle
 │   │   └── checkout_service.go     #    price allowlist, customer reuse
 │   │
-│   ├── handler/
-│   │   └── stripe_handler.go       # POST /webhook, POST /api/v1/checkout
+│   ├── handler/                    # ── HTTP adapter: decode, delegate, encode ──
+│   │   ├── router.go               #    chi routing + middleware chain
+│   │   ├── stripe_handler.go       #    POST /webhook, POST /api/v1/checkout
+│   │   ├── health.go               #    GET /livez, GET /healthz
+│   │   ├── response.go             #    one error envelope, one decoder
+│   │   └── middleware/             #    request id, access log, recovery, timeout
 │   │
 │   ├── config/                     # env → typed Config, validated once at boot
 │   ├── logger/                     # slog setup, request-id correlation, redaction
@@ -149,6 +153,54 @@ one-second resolution, so two genuinely distinct events for one subscription
 routinely share a timestamp, and rejecting equality would silently drop the
 second.
 
+
+## Middleware ordering
+
+The global chain is applied outermost first, and two positions are load-bearing
+rather than stylistic:
+
+```
+RequestID  →  AccessLog  →  Recoverer  →  [ Timeout ]  →  handler
+```
+
+- **RequestID is outermost** so every record produced below it — including a
+  panic report — carries the correlation id. An inbound `X-Request-Id` is
+  honoured so a trace survives a proxy hop, but only after a length and
+  character check: the value is echoed into a response header and into every log
+  line for the request, so a caller-supplied newline would let it forge log
+  records.
+
+- **AccessLog sits outside Recoverer.** It reads the status *after* the inner
+  handler returns. Reversed, a panic unwinds through AccessLog before anything
+  has been written, and the request is recorded as a 200 — or not recorded at
+  all, since the log call is never reached. With Recoverer inside, the recovered
+  500 is already written by the time AccessLog looks.
+
+  This is verified, not asserted. `TestAccessLogOutsideRecovererRecordsThePanicStatus`
+  proves the correct order reports 500, and
+  `TestRecovererOutsideAccessLogMisreportsThePanic` is its negative control: it
+  fails if the reversed order ever starts reporting correctly, which would mean
+  the constraint no longer holds and this section is stale.
+
+- **Timeout is applied per route group, not globally.** The health probes carry
+  their own short deadline and must stay answerable when everything else is
+  saturated. The webhook deadline is the longer of the two, because
+  `checkout.session.completed` makes an outbound call to Stripe before it writes
+  anything.
+
+`Timeout` cancels the request context rather than racing the handler from a
+watchdog goroutine the way `http.TimeoutHandler` does. That type buffers the
+entire response so it can discard it and substitute its own, which would defeat
+`http.MaxBytesReader` on the webhook route and make every response allocate
+twice. Cancelling the context instead reaches the places that actually block —
+pgx queries and the Stripe HTTP client both honour it — and no two goroutines
+ever hold the `ResponseWriter` at once. The 503 is therefore written only after
+the handler returns, and only if it returned without writing.
+
+That leaves one gap by construction: a handler that ignores its context cannot
+be interrupted this way. `http.Server.WriteTimeout` is the backstop, which is
+why config refuses to start when a request deadline is longer than it —
+otherwise the connection is torn down before the middleware can answer.
 
 ## Query contracts the repository layer must honour
 
