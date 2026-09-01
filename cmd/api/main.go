@@ -26,7 +26,11 @@ import (
 
 	"github.com/mlkad/stripe-payment-service/internal/config"
 	"github.com/mlkad/stripe-payment-service/internal/database"
+	"github.com/mlkad/stripe-payment-service/internal/handler"
 	"github.com/mlkad/stripe-payment-service/internal/logger"
+	"github.com/mlkad/stripe-payment-service/internal/repository/postgres"
+	"github.com/mlkad/stripe-payment-service/internal/service"
+	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
 )
 
 // Injected at build time via -ldflags.
@@ -114,9 +118,38 @@ func run() error {
 	// server has drained. The defer is the safety net for the error paths below.
 	defer db.Close()
 
+	stripeClient, err := paystripe.New(paystripe.Config{
+		SecretKey:                cfg.Stripe.SecretKey.Reveal(),
+		WebhookSecret:            cfg.Stripe.WebhookSecret.Reveal(),
+		APIVersion:               cfg.Stripe.APIVersion,
+		MaxNetworkRetries:        cfg.Stripe.MaxNetworkRetries,
+		HTTPTimeout:              cfg.Stripe.HTTPTimeout,
+		WebhookTolerance:         cfg.Stripe.WebhookTolerance,
+		IgnoreAPIVersionMismatch: cfg.Stripe.IgnoreAPIVersionMismatch,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("build stripe client: %w", err)
+	}
+
+	userRepo := postgres.NewUserRepo(db.Pool())
+	subRepo := postgres.NewSubscriptionRepo(db.Pool())
+	webhookRepo := postgres.NewWebhookRepo(db.Pool(), 0)
+
+	webhookService := service.NewWebhookService(userRepo, subRepo, webhookRepo, stripeClient, log)
+	checkoutService, err := service.NewCheckoutService(userRepo, stripeClient, service.CheckoutConfig{
+		SuccessURL:      cfg.Stripe.CheckoutSuccessURL,
+		CancelURL:       cfg.Stripe.CheckoutCancelURL,
+		AllowedPriceIDs: cfg.Stripe.AllowedPriceIDs,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("build checkout service: %w", err)
+	}
+
+	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
+
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr(),
-		Handler:           newRouter(db, log, version),
+		Handler:           newRouter(db, stripeHandler, log, version),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
@@ -178,10 +211,11 @@ func run() error {
 
 // newRouter builds the handler tree. Dependencies arrive as arguments; nothing
 // is read from package scope.
-func newRouter(db *database.DB, log *slog.Logger, version string) http.Handler {
+func newRouter(db *database.DB, stripeHandler *handler.StripeHandler, log *slog.Logger, version string) http.Handler {
 	h := &healthHandler{db: db, log: log, version: version, startedAt: time.Now()}
 
 	mux := http.NewServeMux()
+	stripeHandler.Register(mux)
 	// Liveness: is the process running? Deliberately does not touch the
 	// database. Restarting this container cannot fix a database outage, so
 	// making liveness depend on the database converts a database blip into a
@@ -269,9 +303,9 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 // --- middleware --------------------------------------------------------------
 //
-// These live here rather than in internal/handler/http/middleware because they
-// serve the server itself. The request-scoped middleware for the Stripe API
-// surface arrives with the handlers in Step 3.
+// These live here rather than in internal/handler because they serve the server
+// itself: every route gets them, including the health probes, and they must wrap
+// the Stripe surface from the outside.
 
 const requestIDHeader = "X-Request-Id"
 
