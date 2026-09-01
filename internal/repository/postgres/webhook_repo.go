@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,6 +30,7 @@ type WebhookRepository interface {
 	TryClaimEvent(ctx context.Context, w *domain.ProcessedWebhook) (bool, error)
 	MarkEventProcessed(ctx context.Context, eventID string) error
 	MarkEventFailed(ctx context.Context, eventID string, cause error) error
+	MarkEventSkipped(ctx context.Context, eventID, reason string) error
 }
 
 type WebhookRepo struct {
@@ -117,6 +119,31 @@ func (r *WebhookRepo) MarkEventProcessed(ctx context.Context, eventID string) er
 	return nil
 }
 
+// MarkEventSkipped settles a claimed event the service does not subscribe to.
+//
+// Distinct from succeeded on purpose: the ledger should show that an event was
+// seen and deliberately ignored, not that work was performed. Terminal, so
+// processed_at is set to satisfy processed_webhooks_processed_at_chk.
+//
+// reason lands in last_error, which the CHECK constraint only *requires* for
+// failed rows but does not reserve. An operator auditing the ledger needs to
+// know why a row was skipped, and there is no other column for it.
+func (r *WebhookRepo) MarkEventSkipped(ctx context.Context, eventID, reason string) error {
+	const query = `
+		UPDATE processed_webhooks
+		SET status = 'skipped', processed_at = now(), last_error = $2
+		WHERE event_id = $1 AND status = 'processing'`
+
+	tag, err := r.pool.Exec(ctx, query, eventID, truncate(reason))
+	if err != nil {
+		return mapError("mark webhook skipped", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark webhook skipped %s: %w", eventID, domain.ErrEventNotClaimed)
+	}
+	return nil
+}
+
 // MarkEventFailed records a failed attempt and leaves the event reclaimable.
 // processed_at stays NULL, which processed_webhooks_processed_at_chk requires
 // for a non-terminal status.
@@ -139,14 +166,24 @@ func (r *WebhookRepo) MarkEventFailed(ctx context.Context, eventID string, cause
 // failureReason renders cause for last_error, which the CHECK constraint
 // requires to be non-null whenever status is 'failed'.
 func failureReason(cause error) string {
-	msg := "unspecified failure"
-	if cause != nil && cause.Error() != "" {
-		msg = cause.Error()
+	if cause == nil || cause.Error() == "" {
+		return "unspecified failure"
 	}
-	if len(msg) > maxLastErrorLen {
-		msg = msg[:maxLastErrorLen] + "…"
+	return truncate(cause.Error())
+}
+
+// truncate bounds free text destined for last_error. Driver errors can carry an
+// entire query plus parameters, and this column is read by operators.
+func truncate(s string) string {
+	if len(s) <= maxLastErrorLen {
+		return s
 	}
-	return msg
+	// Cut on a rune boundary so the column never holds a broken sequence.
+	cut := maxLastErrorLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 func payloadOrNil(p []byte) any {
