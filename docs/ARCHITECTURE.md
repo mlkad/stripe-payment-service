@@ -20,6 +20,7 @@ Concretely:
 | Domain | `internal/domain/**` | Go stdlib only | pgx, stripe-go, net/http |
 | Application | `internal/service/**` | domain (entities + port interfaces) | pgx, stripe-go, net/http |
 | Adapters (driven) | `internal/repository/postgres`, `internal/adapter/stripe` | domain, pgx / stripe-go | handler, service internals |
+| Infrastructure | `internal/config`, `internal/logger`, `internal/database` | stdlib, pgx | domain, service, handler |
 | Adapters (driving) | `internal/handler/http` | domain, service | pgx, stripe-go |
 | Composition | `cmd/api` | everything — the only place wiring happens | — |
 
@@ -62,11 +63,10 @@ stripe-payment-service/
 │   │       └── middleware/         #    request id, structured logging, recovery,
 │   │                               #    rate limit, signature verification
 │   │
-│   └── platform/                   # ── framework glue, no business logic ──
-│       ├── postgres/               #    pgxpool construction, health, tx helper
-│       ├── logger/                 #    slog setup, redaction of secrets/PII
-│       ├── httpserver/             #    server + graceful shutdown
-│       └── validator/              #    request validation
+│   ├── config/                     # env -> typed Config, validated once at boot
+│   ├── logger/                     # slog setup, request-id correlation, redaction
+│   ├── database/                   # pgxpool construction, health, query tracing
+│   └── validator/                  # request validation
 │
 ├── migrations/                     # Goose SQL migrations (source of truth for schema)
 ├── pkg/                            # genuinely reusable, import-safe by third parties
@@ -129,3 +129,42 @@ long transaction would carry a timestamp *older* than rows committed by shorter
 transactions that started later — which silently breaks "everything changed since
 T" incremental sync and makes the audit trail lie. `clock_timestamp()` reads the
 wall clock at the moment the row is written.
+
+
+## Startup and shutdown
+
+Construction happens once, in `run()`, and every dependency is passed as an
+argument. `slog.SetDefault` is deliberately not called: a package that logs
+through the default logger should show up as a missing wire, not be silently
+absorbed.
+
+Shutdown order is load-bearing:
+
+```
+SIGTERM/SIGINT
+  -> stop trapping signals   (a second Ctrl-C now kills immediately)
+  -> srv.Shutdown(timeout)   (stop accepting; drain in-flight requests)
+  -> db.Close()              (blocks until every connection is returned)
+```
+
+Closing the pool first would tear connections out from under requests that are
+still finishing, potentially mid-transaction. The signal context is **not** used
+as the server's `BaseContext` for the same reason — that would cancel every
+in-flight request the instant the signal arrives and defeat the drain entirely.
+
+## Production safety checks at boot
+
+`config.Validate` refuses to start on any of these, reporting all violations at
+once rather than one per restart:
+
+- a **live** Stripe key when `APP_ENV` is not production — a live key on a
+  developer's laptop moves real money against real customers
+- a **test** Stripe key when `APP_ENV` is production — silently accepts payments
+  that never settle
+- `sslmode=disable` in production
+- `DB_MIN_CONNS` above `DB_MAX_CONNS`, an out-of-range port, an unknown log level
+
+Secrets use the `config.Secret` type, which redacts itself through `fmt`, `slog`
+and `encoding/json`. The boot log prints the whole effective configuration with
+every secret replaced, so operators can confirm what loaded without the
+configuration becoming the leak.
