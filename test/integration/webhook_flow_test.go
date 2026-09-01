@@ -68,10 +68,21 @@ func newWebhookStack(t *testing.T) (*service.WebhookService, http.Handler) {
 		t.Fatalf("build checkout service: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	handler.NewStripeHandler(svc, checkout, log).Register(mux)
-	return svc, mux
+	// The full router, not a bare mux: these tests then exercise the real
+	// middleware chain - correlation, access logging, recovery and the per-route
+	// deadline - rather than the handler in isolation.
+	router := handler.NewRouter(
+		handler.NewStripeHandler(svc, checkout, log),
+		handler.NewHealthHandler(stubProbe{}, log, "test"),
+		handler.RouterConfig{},
+		log,
+	)
+	return svc, router
 }
+
+type stubProbe struct{}
+
+func (stubProbe) HealthCheck(context.Context) error { return nil }
 
 // subscriptionEvent renders a customer.subscription.* payload in the shape the
 // pinned API version produces: the billing period lives on the item, not on the
