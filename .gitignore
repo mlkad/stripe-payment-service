@@ -1,0 +1,22 @@
+# Secrets - never commit a live Stripe key
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Build output
+bin/
+dist/
+/api
+
+# Test + tooling
+coverage.out
+coverage.html
+*.test
+vendor/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,174 @@
+# =============================================================================
+# Stripe Payment & Subscription Gateway - local / CI stack
+#
+#   make up          bring up postgres + run migrations + start the API
+#   make stripe      forward live Stripe events to the local webhook endpoint
+#
+# Compose Spec v2 (no `version:` key - it is obsolete and warns on modern CLIs).
+# =============================================================================
+
+name: stripe-payment-service
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 - system of record
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: sps-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      # Enforce SCRAM rather than the historical md5 default.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: UTC
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      # Keep every statement > 500ms in the log; this is how you catch a missing
+      # index before your customers do.
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_checkpoints=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - timezone=UTC
+    ports:
+      # Bind to loopback only - never expose a database on 0.0.0.0.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -q + explicit user/db: the default check passes while the DB is still
+      # running its init scripts, which lets migrations start too early.
+      test: ["CMD-SHELL", "pg_isready -q -U ${POSTGRES_USER:-payments} -d ${POSTGRES_DB:-payments}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    logging: *default-logging
+    networks: [payments]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ---------------------------------------------------------------------------
+  # Goose migrator - one-shot; the API will not start until this exits 0
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: migrator
+    container_name: sps-migrate
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: >-
+        host=postgres port=5432
+        user=${POSTGRES_USER:-payments}
+        password=${POSTGRES_PASSWORD}
+        dbname=${POSTGRES_DB:-payments}
+        sslmode=disable
+      GOOSE_MIGRATION_DIR: /migrations
+      # NOTE: goose has no GOOSE_TABLE env var - the version table name is the
+      # `-table` flag only. We keep the default `goose_db_version`: passing the
+      # flag inconsistently would create a second version table and re-run every
+      # migration against a live database.
+    command: ["up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+    networks: [payments]
+
+  # ---------------------------------------------------------------------------
+  # API - HTTP gateway (checkout, portal, webhooks)
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: api
+    container_name: sps-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-payments}?sslmode=disable&pool_max_conns=25
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The image is distroless (no shell, no curl), so the binary probes itself.
+      test: ["CMD", "/app/api", "-healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 20s
+    logging: *default-logging
+    networks: [payments]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Stripe CLI - forwards real test-mode events to the local webhook endpoint.
+  # Opt-in:  docker compose --profile dev up stripe-cli
+  # ---------------------------------------------------------------------------
+  stripe-cli:
+    image: stripe/stripe-cli:v1.21.8
+    container_name: sps-stripe-cli
+    profiles: ["dev"]
+    environment:
+      STRIPE_API_KEY: ${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY is required for the dev profile}
+    command:
+      - listen
+      - --forward-to
+      - http://api:8080/api/v1/webhooks/stripe
+      - --skip-verify
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [payments]
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  payments:
+    driver: bridge
