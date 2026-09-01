@@ -59,22 +59,20 @@ stripe-payment-service/
 │   │       ├── subscription_repo.go
 │   │       └── webhook_repo.go     #    claim / settle idempotency
 │   │
+│   ├── stripe/                     # ── the only package importing stripe-go ──
+│   │   └── client.go               #    checkout, subscription reads, signature
+│   │                               #    verification, error classification
+│   │
+│   ├── service/                    # ── use cases over domain + ports ──
+│   │   ├── webhook_service.go      #    verify → claim → dispatch → settle
+│   │   └── checkout_service.go     #    price allowlist, customer reuse
+│   │
+│   ├── handler/
+│   │   └── stripe_handler.go       # POST /webhook, POST /api/v1/checkout
+│   │
 │   ├── config/                     # env → typed Config, validated once at boot
 │   ├── logger/                     # slog setup, request-id correlation, redaction
-│   ├── database/                   # pgxpool construction, health, query tracing
-│   │
-│   ├── service/                    # ── planned: use cases over domain + ports ──
-│   │   ├── billing/                #    CreateCheckoutSession, CreatePortalSession
-│   │   └── webhook/                #    ProcessEvent: claim → dispatch → settle
-│   │
-│   ├── adapter/
-│   │   └── stripe/                 # planned: stripe-go behind an owned interface
-│   │
-│   └── handler/
-│       └── http/                   # planned: routing, decode/encode, status mapping
-│           ├── dto/                #    wire types — never leak domain structs
-│           └── middleware/         #    request id, structured logging, recovery,
-│                                   #    rate limit, signature verification
+│   └── database/                   # pgxpool construction, health, query tracing
 │
 ├── migrations/                     # Goose SQL migrations (source of truth for schema)
 ├── pkg/                            # genuinely reusable, import-safe by third parties
@@ -120,6 +118,24 @@ A `false` from `TryClaimEvent` is not an error — the event is finished or in
 flight elsewhere, and it must still be acknowledged to Stripe with a 2xx.
 Returning non-2xx there would make Stripe redeliver an event that needs no work.
 
+**Signature verification runs before the claim, and this ordering is a security
+property rather than a preference.** `event_id`, `event_type` and `created` all
+come from the request body, and until the signature is checked that body is
+unauthenticated input from an anonymous caller. Claiming first would let anyone
+POST `{"id":"evt_..."}` for an event id they guessed or observed, insert a
+settled row, and cause Stripe's genuine delivery to be discarded as a duplicate —
+a silent, unauthenticated denial of service against billing state.
+
+This is verified, not asserted: `TestWebhook_ForgedPayloadNeverReachesLedger`
+fails when the ordering is reversed, and in that configuration a forged request
+is answered `200` because the row it planted made the next delivery look like a
+duplicate.
+
+The webhook body is read raw and whole — the signature covers the exact bytes
+Stripe sent, so decoding and re-encoding the JSON invalidates it. That means the
+payload is fully in memory before it can be trusted, and `http.MaxBytesReader`
+(256 KiB) is the only thing between an anonymous POST and the heap.
+
 The out-of-order guard in `UpdateSubscriptionStatus` reads
 `last_stripe_event_at`, decides, then writes. Under READ COMMITTED that sequence
 is atomic only because the row is held with `SELECT ... FOR UPDATE`; performing
@@ -156,9 +172,9 @@ the webhook idempotency claim. It runs inside a transaction that rolls back, so 
 is safe against any migrated database.
 
 `test/integration` (`make test-integration`) is the executable form of the
-repository contracts: constraint-to-sentinel translation, trigger side effects,
-the stale-claim window, and the two concurrency guarantees above, run under
-`-race` against a live PostgreSQL 16.
+repository and webhook contracts: constraint-to-sentinel translation, trigger
+side effects, the stale-claim window, the two concurrency guarantees above, and
+the full HTTP webhook path — run under `-race` against a live PostgreSQL 16.
 
 ## Why `clock_timestamp()` in the updated_at trigger
 

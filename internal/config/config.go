@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -115,6 +116,21 @@ type Stripe struct {
 	APIVersion        string
 	WebhookTolerance  time.Duration
 	MaxNetworkRetries int
+	HTTPTimeout       time.Duration
+
+	// IgnoreAPIVersionMismatch disables the SDK's check that an event was
+	// rendered by the API release train it deserialises against. Enable it only
+	// while migrating a webhook endpoint between versions.
+	IgnoreAPIVersionMismatch bool
+
+	CheckoutSuccessURL string
+	CheckoutCancelURL  string
+
+	// AllowedPriceIDs restricts what a checkout request may ask for. Empty means
+	// unrestricted, which Validate refuses in production: the price id arrives
+	// in the request body, so without an allowlist any caller can subscribe
+	// against any price in the account.
+	AllowedPriceIDs []string
 }
 
 type Log struct {
@@ -186,9 +202,16 @@ func Load() (*Config, error) {
 			SecretKey:         Secret(l.required("STRIPE_SECRET_KEY")),
 			WebhookSecret:     Secret(l.required("STRIPE_WEBHOOK_SECRET")),
 			PublishableKey:    l.str("STRIPE_PUBLISHABLE_KEY", ""),
-			APIVersion:        l.str("STRIPE_API_VERSION", "2024-06-20"),
+			APIVersion:        l.str("STRIPE_API_VERSION", "2026-08-26.dahlia"),
 			WebhookTolerance:  l.duration("STRIPE_WEBHOOK_TOLERANCE", 5*time.Minute),
 			MaxNetworkRetries: l.intVal("STRIPE_MAX_NETWORK_RETRIES", 3),
+			HTTPTimeout:       l.duration("STRIPE_HTTP_TIMEOUT", 20*time.Second),
+
+			IgnoreAPIVersionMismatch: l.boolVal("STRIPE_IGNORE_API_VERSION_MISMATCH", false),
+
+			CheckoutSuccessURL: l.str("STRIPE_CHECKOUT_SUCCESS_URL", "http://localhost:3000/billing/success?session_id={CHECKOUT_SESSION_ID}"),
+			CheckoutCancelURL:  l.str("STRIPE_CHECKOUT_CANCEL_URL", "http://localhost:3000/billing/cancel"),
+			AllowedPriceIDs:    l.csv("STRIPE_ALLOWED_PRICE_IDS"),
 		},
 		Log: Log{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
@@ -307,6 +330,43 @@ func (c *Config) validateStripe() []error {
 	if c.Stripe.MaxNetworkRetries < 0 {
 		add("STRIPE_MAX_NETWORK_RETRIES must not be negative (got %d)", c.Stripe.MaxNetworkRetries)
 	}
+	if c.Stripe.HTTPTimeout <= 0 {
+		add("STRIPE_HTTP_TIMEOUT must be positive")
+	}
+
+	for name, raw := range map[string]string{
+		"STRIPE_CHECKOUT_SUCCESS_URL": c.Stripe.CheckoutSuccessURL,
+		"STRIPE_CHECKOUT_CANCEL_URL":  c.Stripe.CheckoutCancelURL,
+	} {
+		u, err := url.Parse(raw)
+		switch {
+		case raw == "":
+			add("%s is required", name)
+		case err != nil || !u.IsAbs():
+			add("%s must be an absolute URL (got %q)", name, raw)
+		case c.App.Environment.IsProduction() && u.Scheme != "https":
+			// The session id is appended to the success URL; over plain HTTP it
+			// is readable by anything on the path.
+			add("%s must use https in production (got scheme %q)", name, u.Scheme)
+		}
+	}
+
+	for _, id := range c.Stripe.AllowedPriceIDs {
+		if !strings.HasPrefix(id, "price_") {
+			add("STRIPE_ALLOWED_PRICE_IDS entry %q must begin with price_", id)
+		}
+	}
+	// The price id arrives in the request body. Without an allowlist, anyone who
+	// can reach /api/v1/checkout can subscribe against any price in the account,
+	// including one belonging to a different product or tier.
+	if c.App.Environment.IsProduction() && len(c.Stripe.AllowedPriceIDs) == 0 {
+		add("STRIPE_ALLOWED_PRICE_IDS must not be empty in production")
+	}
+
+	if c.App.Environment.IsProduction() && c.Stripe.IgnoreAPIVersionMismatch {
+		add("STRIPE_IGNORE_API_VERSION_MISMATCH must not be enabled in production - " +
+			"events would be deserialised against a version they were not rendered for")
+	}
 	return errs
 }
 
@@ -394,4 +454,20 @@ func (l *loader) boolVal(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// csv reads a comma-separated list, discarding blank entries so a trailing
+// comma or a stray space does not become an empty allowlist entry.
+func (l *loader) csv(key string) []string {
+	raw, ok := l.lookup(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
