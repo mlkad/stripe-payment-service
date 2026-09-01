@@ -90,6 +90,14 @@ type HTTP struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
+
+	// APITimeout and WebhookTimeout are the per-request deadlines the router
+	// applies. Both must stay below WriteTimeout: the server closes the
+	// connection at WriteTimeout regardless, so a longer request deadline would
+	// never be reached and the caller would see a dropped connection instead of
+	// the 503 the middleware wants to send.
+	APITimeout     time.Duration
+	WebhookTimeout time.Duration
 }
 
 // Addr renders the listen address for net/http.
@@ -185,6 +193,8 @@ func Load() (*Config, error) {
 			ReadTimeout:       l.duration("HTTP_READ_TIMEOUT", 15*time.Second),
 			WriteTimeout:      l.duration("HTTP_WRITE_TIMEOUT", 30*time.Second),
 			IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+			APITimeout:        l.duration("HTTP_API_TIMEOUT", 10*time.Second),
+			WebhookTimeout:    l.duration("HTTP_WEBHOOK_TIMEOUT", 25*time.Second),
 		},
 		Database: Database{
 			DSN:                Secret(l.required("DATABASE_URL")),
@@ -248,6 +258,21 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.ReadHeaderTimeout <= 0 {
 		add("HTTP_READ_HEADER_TIMEOUT must be positive - a zero value invites Slowloris")
+	}
+
+	// A request deadline that outlives WriteTimeout can never fire: the server
+	// tears the connection down first, so the caller sees a dropped connection
+	// instead of the 503 the timeout middleware wants to send.
+	for name, d := range map[string]time.Duration{
+		"HTTP_API_TIMEOUT":     c.HTTP.APITimeout,
+		"HTTP_WEBHOOK_TIMEOUT": c.HTTP.WebhookTimeout,
+	} {
+		switch {
+		case d <= 0:
+			add("%s must be positive", name)
+		case c.HTTP.WriteTimeout > 0 && d >= c.HTTP.WriteTimeout:
+			add("%s (%s) must be shorter than HTTP_WRITE_TIMEOUT (%s)", name, d, c.HTTP.WriteTimeout)
+		}
 	}
 
 	// An empty DSN is already reported as a missing required variable; adding
