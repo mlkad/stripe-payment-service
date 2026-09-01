@@ -3,7 +3,7 @@
 Production-grade Go microservice for Stripe Checkout, subscription lifecycle
 tracking, Customer Portal, and idempotent webhook processing.
 
-**Stack:** Go 1.23+ · PostgreSQL 16 (pgx/v5) · Goose · Docker · slog
+**Stack:** Go 1.25+ · PostgreSQL 16 (pgx/v5) · Goose · Docker · slog
 **Architecture:** Clean / Hexagonal — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
@@ -72,14 +72,27 @@ or they fall off the partial index (0.037 ms → 20.96 ms at 50k rows).
 ## Layout
 
 ```
-cmd/api            composition root
+cmd/api            composition root + graceful shutdown
+internal/config    env -> typed Config, validated once at boot
+internal/logger    slog setup, request-id correlation, redaction
+internal/database  pgxpool construction, health, query tracing
 internal/domain    entities + ports, zero I/O
 internal/service   use cases
 internal/repository/postgres, internal/adapter/stripe   driven adapters
 internal/handler/http                                   driving adapter
-internal/platform  pool, logger, server, validation
 migrations         schema source of truth
 ```
+
+### Health endpoints
+
+| Endpoint | Checks | Used by |
+|---|---|---|
+| `GET /livez` | process only | container `HEALTHCHECK`, k8s liveness |
+| `GET /healthz` | process **and** database | load balancer, k8s readiness |
+
+Liveness deliberately ignores the database. Restarting this container cannot
+repair a database outage, so wiring liveness to the database converts one DB blip
+into a cluster-wide restart loop.
 
 ---
 
@@ -95,7 +108,8 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 ## Roadmap
 
 - [x] **Step 1** — infrastructure, Docker stack, database schema
-- [ ] **Step 2** — config, pgx pool, domain entities + ports, repositories
+- [x] **Step 2** — config, logger, pgx pool, server + graceful shutdown
+- [ ] **Step 2b** — domain entities + ports, repositories
 - [ ] **Step 3** — Stripe adapter, Checkout + Customer Portal use cases
 - [ ] **Step 4** — webhook handler: signature verification, claim/dispatch/settle
 - [ ] **Step 5** — integration tests (testcontainers), CI, observability
