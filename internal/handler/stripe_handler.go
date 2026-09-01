@@ -4,7 +4,6 @@
 package handler
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
+	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
 )
@@ -26,9 +26,6 @@ const (
 	// own events stay well under 100 KiB; the largest legitimate ones are
 	// invoices with many line items.
 	maxWebhookBytes int64 = 256 << 10
-
-	// maxAPIBytes caps ordinary JSON request bodies, which are small structs.
-	maxAPIBytes int64 = 32 << 10
 
 	signatureHeader = "Stripe-Signature"
 )
@@ -44,13 +41,6 @@ type StripeHandler struct {
 
 func NewStripeHandler(webhooks *service.WebhookService, checkout *service.CheckoutService, log *slog.Logger) *StripeHandler {
 	return &StripeHandler{webhooks: webhooks, checkout: checkout, log: log, maxWebhookBytes: maxWebhookBytes}
-}
-
-// Register mounts the Stripe surface. Route patterns live with the handler so
-// the composition root does not have to know them.
-func (h *StripeHandler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /webhook", h.HandleWebhook)
-	mux.HandleFunc("POST /api/v1/checkout", h.HandleCheckout)
 }
 
 // --- webhook -----------------------------------------------------------------
@@ -69,7 +59,7 @@ func (h *StripeHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get(signatureHeader)
 	if signature == "" {
 		h.log.WarnContext(ctx, "webhook rejected: missing signature header",
-			slog.String("remote_addr", remoteIP(r)))
+			slog.String("remote_addr", middleware.ClientIP(r)))
 		writeError(w, http.StatusBadRequest, "missing signature")
 		return
 	}
@@ -86,7 +76,7 @@ func (h *StripeHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &tooLarge) {
 			h.log.WarnContext(ctx, "webhook rejected: payload too large",
 				slog.Int64("limit_bytes", limit),
-				slog.String("remote_addr", remoteIP(r)))
+				slog.String("remote_addr", middleware.ClientIP(r)))
 			writeError(w, http.StatusRequestEntityTooLarge, "payload too large")
 			return
 		}
@@ -103,7 +93,7 @@ func (h *StripeHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		// from a stale timestamp tells a forger which half of the check they
 		// have already defeated.
 		h.log.WarnContext(ctx, "webhook signature verification failed",
-			slog.String("remote_addr", remoteIP(r)),
+			slog.String("remote_addr", middleware.ClientIP(r)),
 			slog.Int("payload_bytes", len(payload)),
 			slog.String("error", err.Error()))
 		writeError(w, http.StatusBadRequest, "signature verification failed")
@@ -190,52 +180,4 @@ func (h *StripeHandler) writeServiceError(w http.ResponseWriter, r *http.Request
 		h.log.ErrorContext(ctx, "checkout failed", slog.String("error", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
-}
-
-// --- transport helpers -------------------------------------------------------
-
-// decodeJSON reads a size-limited body and rejects unknown fields, so a typo in
-// a client's payload surfaces as an error instead of a silently ignored value.
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
-		return errors.New("content-type must be application/json")
-	}
-
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAPIBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			return errors.New("request body too large")
-		}
-		return errors.New("request body is not valid JSON")
-	}
-	// A second value in the stream means the client sent something other than
-	// the single object this endpoint accepts.
-	if dec.More() {
-		return errors.New("request body must contain a single JSON object")
-	}
-	return nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
-}
-
-// remoteIP is used for abuse logging only. It reads RemoteAddr rather than
-// X-Forwarded-For, which is caller-controlled unless a trusted proxy overwrites
-// it; treating it as identity would let anyone forge the audit trail.
-func remoteIP(r *http.Request) string {
-	host, _, found := strings.Cut(r.RemoteAddr, ":")
-	if !found {
-		return r.RemoteAddr
-	}
-	return host
 }
