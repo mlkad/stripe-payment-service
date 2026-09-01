@@ -7,10 +7,10 @@ Everything else may import `domain`; nothing in `domain` may import anything els
 
 ```
         handler/http ──┐
-                       ├──> service ──> domain <── (ports defined here)
+                       ├──> service ──> domain
    repository/postgres ┘        ▲
         adapter/stripe ─────────┘
-                (adapters implement domain ports)
+        (service depends on port interfaces; adapters satisfy them)
 ```
 
 Concretely:
@@ -24,9 +24,20 @@ Concretely:
 | Adapters (driving) | `internal/handler/http` | domain, service | pgx, stripe-go |
 | Composition | `cmd/api` | everything — the only place wiring happens | — |
 
-**Ports live with the domain, not with the implementation.** `domain/subscription`
-declares `Repository`; `repository/postgres` implements it. That inversion is what
-lets the service layer be unit-tested with no database and no Stripe account.
+**Ports are declared as interfaces, and the service layer depends only on those.**
+`repository/postgres` declares `UserRepository`, `SubscriptionRepository` and
+`WebhookRepository` alongside the concrete types that satisfy them, each pinned
+with a `var _ Port = (*Impl)(nil)` assertion. The service layer accepts the
+interface, which is what lets it be unit-tested with no database and no Stripe
+account.
+
+Textbook hexagonal would put those interfaces in `internal/domain`. They sit with
+the adapter here for one concrete reason: `SubscriptionStatusUpdate` is a Stripe
+event-shaped parameter struct — every field below `Status` is an optional pointer
+because Stripe events vary in which fields they populate — and moving it into the
+domain would drag Stripe's wire semantics into the layer that is supposed to be
+free of them. The dependency rule is unaffected: `domain` still imports nothing
+from `repository`, and the arrow still points inward.
 
 ## Directory structure
 
@@ -37,36 +48,33 @@ stripe-payment-service/
 │       └── main.go
 │
 ├── internal/
-│   ├── config/                     # env → typed Config, validated once at boot
-│   │
 │   ├── domain/                     # ── pure business core, zero I/O ──
-│   │   ├── shared/                 #    sentinel errors, Clock, ID types
-│   │   ├── user/                   #    User entity + Repository port
-│   │   ├── subscription/           #    Subscription entity, Status VO,
-│   │   │                           #    state-transition rules, Repository port
-│   │   └── webhook/                #    Event value object, EventType,
-│   │                               #    IdempotencyStore port
+│   │   └── models.go               #    User, Subscription, ProcessedWebhook,
+│   │                               #    status value objects, sentinel errors
 │   │
-│   ├── service/                    # ── use cases; orchestrate domain + ports ──
+│   ├── repository/
+│   │   └── postgres/               # ── pgx/v5 adapters + the ports they satisfy ──
+│   │       ├── errors.go           #    SQLSTATE → domain sentinel translation
+│   │       ├── user_repo.go
+│   │       ├── subscription_repo.go
+│   │       └── webhook_repo.go     #    claim / settle idempotency
+│   │
+│   ├── config/                     # env → typed Config, validated once at boot
+│   ├── logger/                     # slog setup, request-id correlation, redaction
+│   ├── database/                   # pgxpool construction, health, query tracing
+│   │
+│   ├── service/                    # ── planned: use cases over domain + ports ──
 │   │   ├── billing/                #    CreateCheckoutSession, CreatePortalSession
 │   │   └── webhook/                #    ProcessEvent: claim → dispatch → settle
 │   │
-│   ├── repository/
-│   │   └── postgres/               # pgx/v5 implementations of the domain ports
-│   │
 │   ├── adapter/
-│   │   └── stripe/                 # stripe-go client behind a domain-owned interface
+│   │   └── stripe/                 # planned: stripe-go behind an owned interface
 │   │
-│   ├── handler/
-│   │   └── http/                   # routing, decode/encode, status mapping
-│   │       ├── dto/                #    wire types — never leak domain structs
-│   │       └── middleware/         #    request id, structured logging, recovery,
-│   │                               #    rate limit, signature verification
-│   │
-│   ├── config/                     # env -> typed Config, validated once at boot
-│   ├── logger/                     # slog setup, request-id correlation, redaction
-│   ├── database/                   # pgxpool construction, health, query tracing
-│   └── validator/                  # request validation
+│   └── handler/
+│       └── http/                   # planned: routing, decode/encode, status mapping
+│           ├── dto/                #    wire types — never leak domain structs
+│           └── middleware/         #    request id, structured logging, recovery,
+│                                   #    rate limit, signature verification
 │
 ├── migrations/                     # Goose SQL migrations (source of truth for schema)
 ├── pkg/                            # genuinely reusable, import-safe by third parties
@@ -74,7 +82,7 @@ stripe-payment-service/
 ├── deployments/docker/             # Dockerfile (multi-target)
 ├── scripts/                        # operational one-offs
 ├── test/
-│   ├── integration/                # testcontainers: real Postgres, build-tagged
+│   ├── integration/                # real Postgres, `integration` build tag
 │   └── fixtures/                   # golden Stripe event payloads
 └── docs/
 ```
@@ -87,17 +95,43 @@ Only `pkg/` is part of the public surface.
 Stripe delivers **at least once, unordered**, retrying for up to 3 days. Two
 mechanisms keep the local read-model correct:
 
-1. **Dedupe** — `processed_webhooks.event_id` is the primary key. A handler claims
-   the row (`INSERT ... ON CONFLICT`) inside the same transaction as the state
-   change, so a duplicate delivery is a no-op even across pods.
+1. **Dedupe** — `processed_webhooks.event_id` is the primary key, so the unique
+   index itself performs the mutual exclusion: exactly one caller can create the
+   row. `TryClaimEvent` is an `INSERT ... ON CONFLICT DO UPDATE ... WHERE`, and
+   the `WHERE` decides who may retry — a `failed` row is reclaimable, a
+   `processing` row only once its claim has gone stale, and a `succeeded` row
+   never. No advisory locks, no application-side coordination.
 2. **Ordering** — `subscriptions.last_stripe_event_at` holds the `event.created` of
    the newest event applied. An arriving event older than that is acknowledged and
    discarded, so a retry of a stale `customer.subscription.updated` cannot resurrect
    a canceled subscription.
 
-Both the claim and the business write happen in one transaction. Commit means
-"processed"; rollback means Stripe retries. There is no window where one happened
-without the other.
+**The protocol is claim → dispatch → settle, not one transaction.** Holding a
+single transaction across the business write would remove the need for the
+`processing` status, `attempts`, and the stale-claim window — but it would also
+mean a worker that dies mid-event leaves nothing behind to diagnose or retry
+distinctly from a first delivery. Instead: `TryClaimEvent` commits the claim,
+the handler does its work, and `MarkEventProcessed` / `MarkEventFailed` settle
+it. Both settle calls carry `AND status = 'processing'`, so a worker that
+resumes after its claim was reclaimed gets `ErrEventNotClaimed` rather than
+overwriting the outcome recorded by whoever took over.
+
+A `false` from `TryClaimEvent` is not an error — the event is finished or in
+flight elsewhere, and it must still be acknowledged to Stripe with a 2xx.
+Returning non-2xx there would make Stripe redeliver an event that needs no work.
+
+The out-of-order guard in `UpdateSubscriptionStatus` reads
+`last_stripe_event_at`, decides, then writes. Under READ COMMITTED that sequence
+is atomic only because the row is held with `SELECT ... FOR UPDATE`; performing
+the comparison inside the `UPDATE`'s `WHERE` instead lets two workers both
+observe the same pre-state, and the last committer wins regardless of event
+order. `TestSubscriptionRepo_ConcurrentOutOfOrderEventsConverge` races 24
+shuffled events over 8 rounds and fails every round when the lock is removed.
+
+Equal timestamps are **applied**, not rejected: Stripe reports `event.created` at
+one-second resolution, so two genuinely distinct events for one subscription
+routinely share a timestamp, and rejecting equality would silently drop the
+second.
 
 
 ## Query contracts the repository layer must honour
@@ -120,6 +154,11 @@ canceled rows are never indexed at all.
 contract: 22 assertions covering every constraint, both trigger behaviours, and
 the webhook idempotency claim. It runs inside a transaction that rolls back, so it
 is safe against any migrated database.
+
+`test/integration` (`make test-integration`) is the executable form of the
+repository contracts: constraint-to-sentinel translation, trigger side effects,
+the stale-claim window, and the two concurrency guarantees above, run under
+`-race` against a live PostgreSQL 16.
 
 ## Why `clock_timestamp()` in the updated_at trigger
 
