@@ -517,6 +517,39 @@ scale — a shared counter adds a network round trip and a new failure mode to t
 login path — but it is a ceiling, not a floor, and a horizontally scaled
 deployment should move the state out.
 
+## Test strategy
+
+Two layers, split by what each can actually reach.
+
+**Unit tests** cover the logic that needs no database: configuration
+validation, domain invariants, Stripe error classification and the Stripe →
+domain mappers, password and token handling, middleware, and the logger.
+
+**Integration tests** (`-tags=integration`) cover everything that only exists
+in the presence of PostgreSQL: constraint translation, trigger behaviour,
+concurrency, the webhook pipeline end to end, auth over HTTP, the sweeper and
+retention.
+
+Combined coverage is measured with `-coverpkg=./internal/...` across both, and
+CI fails below 70%. Per-package unit figures are deliberately uneven —
+`repository` and `worker` sit at 0% on their own and are covered entirely by
+integration, because a repository test without a database tests a mock.
+
+### What the tests are written to catch
+
+Where a property matters, the test was checked against a deliberately broken
+implementation rather than assumed to work. `FOR UPDATE` removed from the
+subscription guard, the signature check moved after the claim, the reservation
+cancel dropped from the rate limiter, the invoice cursor pointed at the
+subscription cursor, `data.object` kept wholesale by retention — each of those
+produces a failure, and each is noted where it lives.
+
+Two of those checks turned out **not** to have teeth, and say so: the `alg:none`
+token test passes with or without `WithValidMethods`, because jwt/v5 refuses it
+independently, and the sweeper's claim-level attempts guard survives being
+neutered because the race window is narrower than it looks. Both guards stay;
+neither is claimed as proven.
+
 ## Query contracts the repository layer must honour
 
 Partial indices are the reason the hot paths stay fast at scale, but two of them

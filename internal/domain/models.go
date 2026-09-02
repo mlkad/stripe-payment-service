@@ -159,7 +159,14 @@ type User struct {
 func (u *User) Validate() error {
 	var v validator
 
-	email := strings.TrimSpace(u.Email)
+	// Normalise in place rather than validating a trimmed copy. The repository
+	// persists u.Email, so checking a copy leaves a gap: " ada@example.com" or
+	// "ada@example.com\n" passes here and is then written verbatim, where only
+	// users_email_format_chk stops it - a database round trip later, and as a
+	// constraint violation rather than a field error.
+	u.Email = strings.TrimSpace(u.Email)
+
+	email := u.Email
 	switch {
 	case email == "":
 		v.add("email", "is required")
