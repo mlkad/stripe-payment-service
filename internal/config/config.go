@@ -76,6 +76,7 @@ type Config struct {
 	Database Database
 	Stripe   Stripe
 	Auth     Auth
+	Sweeper  Sweeper
 	Log      Log
 }
 
@@ -184,6 +185,22 @@ type Stripe struct {
 	AllowedPriceIDs []string
 }
 
+// Sweeper configures the background job that recovers and reports failed
+// webhook deliveries.
+type Sweeper struct {
+	Enabled         bool
+	Interval        time.Duration
+	MaxAttempts     int
+	BaseBackoff     time.Duration
+	MaxBackoff      time.Duration
+	BatchSize       int
+	StaleClaimAfter time.Duration
+
+	// AlertAfter is how old the oldest unsettled event may get before the
+	// sweep logs at error level.
+	AlertAfter time.Duration
+}
+
 type Log struct {
 	Level     string
 	Format    string
@@ -283,6 +300,16 @@ func Load() (*Config, error) {
 			AccessTokenTTL: l.duration("JWT_ACCESS_TOKEN_TTL", time.Hour),
 			BcryptCost:     l.intVal("BCRYPT_COST", 12),
 		},
+		Sweeper: Sweeper{
+			Enabled:         l.boolVal("WEBHOOK_SWEEPER_ENABLED", true),
+			Interval:        l.duration("WEBHOOK_SWEEPER_INTERVAL", time.Minute),
+			MaxAttempts:     l.intVal("WEBHOOK_SWEEPER_MAX_ATTEMPTS", 6),
+			BaseBackoff:     l.duration("WEBHOOK_SWEEPER_BASE_BACKOFF", 30*time.Second),
+			MaxBackoff:      l.duration("WEBHOOK_SWEEPER_MAX_BACKOFF", 30*time.Minute),
+			BatchSize:       l.intVal("WEBHOOK_SWEEPER_BATCH_SIZE", 100),
+			StaleClaimAfter: l.duration("WEBHOOK_STALE_CLAIM_AFTER", 5*time.Minute),
+			AlertAfter:      l.duration("WEBHOOK_SWEEPER_ALERT_AFTER", time.Hour),
+		},
 		Log: Log{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
 			Format:    strings.ToLower(l.str("LOG_FORMAT", "json")),
@@ -375,6 +402,7 @@ func (c *Config) Validate() error {
 
 	errs = append(errs, c.validateStripe()...)
 	errs = append(errs, c.validateAuth()...)
+	errs = append(errs, c.validateSweeper()...)
 
 	if _, err := parseLevelName(c.Log.Level); err != nil {
 		add("LOG_LEVEL must be one of debug, info, warn, error (got %q)", c.Log.Level)
@@ -536,6 +564,40 @@ func (c *Config) validateAuth() []error {
 
 	if cost := c.Auth.BcryptCost; cost < 10 || cost > 31 {
 		add("BCRYPT_COST must be between 10 and 31 (got %d)", cost)
+	}
+	return errs
+}
+
+func (c *Config) validateSweeper() []error {
+	if !c.Sweeper.Enabled {
+		return nil
+	}
+	var errs []error
+	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+
+	if c.Sweeper.Interval <= 0 {
+		add("WEBHOOK_SWEEPER_INTERVAL must be positive")
+	}
+	if c.Sweeper.MaxAttempts < 1 {
+		add("WEBHOOK_SWEEPER_MAX_ATTEMPTS must be at least 1 (got %d)", c.Sweeper.MaxAttempts)
+	}
+	if c.Sweeper.BatchSize < 1 {
+		add("WEBHOOK_SWEEPER_BATCH_SIZE must be at least 1 (got %d)", c.Sweeper.BatchSize)
+	}
+	if c.Sweeper.BaseBackoff <= 0 {
+		add("WEBHOOK_SWEEPER_BASE_BACKOFF must be positive")
+	}
+	if c.Sweeper.MaxBackoff < c.Sweeper.BaseBackoff {
+		add("WEBHOOK_SWEEPER_MAX_BACKOFF (%s) must not be shorter than "+
+			"WEBHOOK_SWEEPER_BASE_BACKOFF (%s)", c.Sweeper.MaxBackoff, c.Sweeper.BaseBackoff)
+	}
+	// A stale window shorter than the request deadline lets the sweeper steal
+	// work from a handler that is still running it, and then two workers
+	// process the same event at once.
+	if c.Sweeper.StaleClaimAfter <= c.HTTP.WebhookTimeout {
+		add("WEBHOOK_STALE_CLAIM_AFTER (%s) must exceed HTTP_WEBHOOK_TIMEOUT (%s), "+
+			"or the sweeper reclaims claims that are still being worked on",
+			c.Sweeper.StaleClaimAfter, c.HTTP.WebhookTimeout)
 	}
 	return errs
 }

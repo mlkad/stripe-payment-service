@@ -356,6 +356,68 @@ Details worth keeping:
 - **`npm ci`, not `npm install`** — it fails on a lockfile that has drifted from
   `package.json` instead of quietly resolving something else.
 
+## The webhook sweeper
+
+Failed events used to land in the ledger and stay there. `internal/worker`
+turns that into something that recovers on its own and complains when it
+cannot.
+
+Three jobs per tick:
+
+1. **Reclaim abandoned claims.** A worker that dies mid-event leaves a row in
+   `processing` forever. `TryClaimEvent` would reclaim it once the stale window
+   passes, but only if Stripe redelivers — and Stripe stops after three days.
+   The sweeper moves it to `failed`, which puts it back in reach of the retry
+   path, which does not depend on Stripe at all.
+
+2. **Replay failed events** whose backoff has elapsed, from the payload stored
+   in the ledger. This is the case that matters: Stripe retries for three days,
+   so a bug fixed on day four leaves every event from days one to three
+   permanently unprocessed. Backoff doubles per attempt so a downstream outage
+   does not become a tight loop against it.
+
+3. **Report.** Debug when the ledger is clean, info while a backlog drains,
+   **error** once anything is dead-lettered or the oldest unsettled event ages
+   past `WEBHOOK_SWEEPER_ALERT_AFTER`. That error line is the thing to alert on.
+
+Past `MaxAttempts` an event is dead-lettered and left alone. Something is wrong
+that another attempt will not fix, and continuing to retry would bury the signal
+in noise.
+
+### ReplayEvent skips signature verification, and why that is safe
+
+`WebhookService.ReplayEvent` does not verify a signature, because there is none
+to verify: the `Stripe-Signature` header is not stored, and the payload was
+authenticated when the event first arrived.
+
+That is safe **only** because its argument comes from the ledger, and a row
+reaches the ledger only through `ProcessEvent`, which verifies before it claims.
+It must never be reachable from a request handler, and no caller may build a
+`ProcessedWebhook` from user input and pass it in — doing so would reintroduce
+exactly the forgery `ProcessEvent` exists to prevent. Its only caller is the
+sweeper.
+
+### Running on every replica is safe
+
+Each row is taken with an atomic claim, and the abandoned-claim scan uses
+`FOR UPDATE SKIP LOCKED`, so instances divide the work instead of blocking on
+each other. Each sweeper also starts with a random offset within its interval,
+so replicas do not all wake together and contend on every tick.
+
+`WEBHOOK_STALE_CLAIM_AFTER` must exceed `HTTP_WEBHOOK_TIMEOUT`, and config
+refuses to start otherwise: a shorter window lets the sweeper reclaim a claim
+that a handler is still working on, and then two workers process one event.
+
+### Operator surface
+
+`api -webhook-report` prints the unsettled ledger and exits **2** when anything
+is dead-lettered, so a cron entry or a monitoring check can act on it without
+parsing output. `api -webhook-sweep` runs a single pass and exits.
+
+A CLI rather than an HTTP route on purpose: an admin endpoint needs an
+authorisation model this service does not have, and inventing one to expose
+diagnostics would be a larger security surface than the diagnostics are worth.
+
 ## Rate limiting
 
 Applied to `POST /api/v1/auth/login` and `/register` only. Those are the only

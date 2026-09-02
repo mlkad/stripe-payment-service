@@ -31,6 +31,53 @@ type WebhookRepository interface {
 	MarkEventProcessed(ctx context.Context, eventID string) error
 	MarkEventFailed(ctx context.Context, eventID string, cause error) error
 	MarkEventSkipped(ctx context.Context, eventID, reason string) error
+
+	// ReclaimAbandonedEvents moves claims left in 'processing' by a crashed
+	// worker into 'failed', where they become retryable.
+	ReclaimAbandonedEvents(ctx context.Context, staleAfter time.Duration, limit int) ([]string, error)
+
+	// ListRetryableEvents returns failed events whose backoff has elapsed and
+	// which have not exhausted their attempts.
+	ListRetryableEvents(ctx context.Context, in RetryQuery) ([]*domain.ProcessedWebhook, error)
+
+	// ClaimEventForRetry atomically moves one failed event back to
+	// 'processing'. False means another worker got there first.
+	ClaimEventForRetry(ctx context.Context, eventID string, maxAttempts int32) (bool, error)
+
+	// LedgerStats summarises the unsettled backlog.
+	LedgerStats(ctx context.Context, maxAttempts int32) (LedgerStats, error)
+}
+
+// RetryQuery bounds a sweep for retryable events.
+type RetryQuery struct {
+	MaxAttempts int32
+
+	// BaseBackoff is doubled per prior attempt, capped at MaxBackoff. Retrying
+	// a failing event every tick would turn a downstream outage into a tight
+	// loop against it.
+	BaseBackoff time.Duration
+	MaxBackoff  time.Duration
+
+	Limit int
+}
+
+// LedgerStats is what an operator needs to know at a glance.
+type LedgerStats struct {
+	// Processing is claims currently in flight. A number that does not fall is
+	// a stuck worker.
+	Processing int64
+
+	// Retryable is failed events still within their attempt budget.
+	Retryable int64
+
+	// DeadLettered is failed events past MaxAttempts. Nothing will retry these
+	// again; they need a human.
+	DeadLettered int64
+
+	// OldestUnsettled is the age of the oldest unsettled row, nil when the
+	// ledger is clean. It is the single most useful number here: a backlog that
+	// is growing older is a different problem from one that is merely large.
+	OldestUnsettled *time.Time
 }
 
 type WebhookRepo struct {
@@ -184,6 +231,151 @@ func truncate(s string) string {
 		cut--
 	}
 	return s[:cut] + "…"
+}
+
+// ReclaimAbandonedEvents rescues claims from a worker that died mid-event.
+//
+// Such a row sits in 'processing' forever otherwise: TryClaimEvent will reclaim
+// it once the stale window passes, but only if Stripe redelivers, and Stripe
+// stops after three days. Moving it to 'failed' puts it back in reach of the
+// retry path, which does not depend on Stripe at all.
+func (r *WebhookRepo) ReclaimAbandonedEvents(ctx context.Context, staleAfter time.Duration, limit int) ([]string, error) {
+	const query = `
+		UPDATE processed_webhooks
+		SET status = 'failed', last_error = $3, processed_at = NULL
+		WHERE event_id IN (
+			SELECT event_id FROM processed_webhooks
+			WHERE status = 'processing'
+			  AND updated_at < now() - make_interval(secs => $1)
+			ORDER BY updated_at
+			LIMIT $2
+			-- Another sweeper may be doing the same scan. Skipping locked rows
+			-- keeps them from blocking on each other rather than dividing the
+			-- work.
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING event_id`
+
+	rows, err := r.pool.Query(ctx, query, staleAfter.Seconds(), limit,
+		"claim abandoned by a worker that did not settle it")
+	if err != nil {
+		return nil, mapError("reclaim abandoned events", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, mapError("reclaim abandoned events: scan", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapError("reclaim abandoned events: iterate", err)
+	}
+	return ids, nil
+}
+
+// ListRetryableEvents finds failed events due for another attempt.
+//
+// The backoff is computed in SQL so the decision and the scan are one
+// operation: 2^(attempts-1) times the base, capped. The status predicate is
+// mandatory - idx_processed_webhooks_unsettled is partial, and without it this
+// becomes a sequential scan over every webhook the service has ever received.
+func (r *WebhookRepo) ListRetryableEvents(ctx context.Context, in RetryQuery) ([]*domain.ProcessedWebhook, error) {
+	const query = `SELECT ` + webhookColumns + `
+		FROM processed_webhooks
+		WHERE status = 'failed'
+		  AND attempts < $1
+		  AND updated_at < now() - make_interval(
+		        secs => LEAST($2::float8 * POWER(2, attempts - 1), $3::float8))
+		ORDER BY updated_at
+		LIMIT $4`
+
+	rows, err := r.pool.Query(ctx, query,
+		in.MaxAttempts, in.BaseBackoff.Seconds(), in.MaxBackoff.Seconds(), in.Limit)
+	if err != nil {
+		return nil, mapError("list retryable events", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.ProcessedWebhook
+	for rows.Next() {
+		w, err := scanWebhook(rows)
+		if err != nil {
+			return nil, mapError("list retryable events: scan", err)
+		}
+		out = append(out, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapError("list retryable events: iterate", err)
+	}
+	return out, nil
+}
+
+// ClaimEventForRetry takes ownership of one failed event.
+//
+// The attempts guard sits inside the UPDATE rather than being checked
+// beforehand, so a stale listing cannot take an event past its budget: two
+// sweepers scanning together both see an event at maxAttempts-1, and the second
+// may still be holding that listing when the first has already failed the event
+// back to 'failed'.
+//
+// Defence in depth rather than a load-bearing check - the window is narrow
+// enough that a six-way concurrent sweep does not reproduce it. Cheap to keep,
+// and the alternative is reasoning about that window on every future change.
+func (r *WebhookRepo) ClaimEventForRetry(ctx context.Context, eventID string, maxAttempts int32) (bool, error) {
+	const query = `
+		UPDATE processed_webhooks
+		SET status = 'processing', attempts = attempts + 1, last_error = NULL
+		WHERE event_id = $1 AND status = 'failed' AND attempts < $2`
+
+	tag, err := r.pool.Exec(ctx, query, eventID, maxAttempts)
+	if err != nil {
+		return false, mapError("claim event for retry", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r *WebhookRepo) LedgerStats(ctx context.Context, maxAttempts int32) (LedgerStats, error) {
+	const query = `
+		SELECT
+			count(*) FILTER (WHERE status = 'processing'),
+			count(*) FILTER (WHERE status = 'failed' AND attempts <  $1),
+			count(*) FILTER (WHERE status = 'failed' AND attempts >= $1),
+			min(updated_at)
+		FROM processed_webhooks
+		WHERE status IN ('processing', 'failed')`
+
+	var stats LedgerStats
+	err := r.pool.QueryRow(ctx, query, maxAttempts).Scan(
+		&stats.Processing, &stats.Retryable, &stats.DeadLettered, &stats.OldestUnsettled)
+	if err != nil {
+		return LedgerStats{}, mapError("ledger stats", err)
+	}
+	return stats, nil
+}
+
+// Unsettled reports whether anything needs attention.
+func (s LedgerStats) Unsettled() int64 { return s.Processing + s.Retryable + s.DeadLettered }
+
+const webhookColumns = `
+	event_id, event_type, api_version, livemode, request_id,
+	status, attempts, last_error, payload,
+	stripe_created_at, received_at, processed_at, created_at, updated_at`
+
+func scanWebhook(r row) (*domain.ProcessedWebhook, error) {
+	var w domain.ProcessedWebhook
+	err := r.Scan(
+		&w.EventID, &w.EventType, &w.APIVersion, &w.Livemode, &w.RequestID,
+		&w.Status, &w.Attempts, &w.LastError, &w.Payload,
+		&w.StripeCreatedAt, &w.ReceivedAt, &w.ProcessedAt, &w.CreatedAt, &w.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
 }
 
 func payloadOrNil(p []byte) any {
