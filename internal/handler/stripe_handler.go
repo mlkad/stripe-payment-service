@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/mlkad/stripe-payment-service/internal/domain"
 	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	"github.com/mlkad/stripe-payment-service/internal/service"
@@ -116,11 +114,11 @@ func (h *StripeHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 // --- checkout ----------------------------------------------------------------
 
+// checkoutRequest carries no user id by design. The caller is the verified
+// token subject; a body field would let anyone open a checkout that bills
+// someone else's saved card, and DisallowUnknownFields means a stale client
+// still sending one gets a 400 rather than being quietly ignored.
 type checkoutRequest struct {
-	// UserID is accepted from the body only because authentication is not yet
-	// wired. Once it is, this field must come from the session: a caller who can
-	// name any user id can open a checkout that bills someone else's card.
-	UserID          string `json:"user_id"`
 	PriceID         string `json:"price_id"`
 	Quantity        int64  `json:"quantity,omitempty"`
 	TrialPeriodDays int64  `json:"trial_period_days,omitempty"`
@@ -140,16 +138,16 @@ type checkoutResponse struct {
 func (h *StripeHandler) HandleCheckout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	userID, err := middleware.UserIDFromContext(ctx)
+	if err != nil {
+		writeUnwiredRoute(w, h.log, ctx, err)
+		return
+	}
+
 	var req checkoutRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		h.log.WarnContext(ctx, "checkout request rejected", slog.String("error", err.Error()))
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	userID, err := uuid.Parse(strings.TrimSpace(req.UserID))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "user_id must be a UUID")
 		return
 	}
 

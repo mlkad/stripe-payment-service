@@ -17,7 +17,6 @@ The backend must be running (`make run` from the repo root).
 | Variable | Purpose |
 |---|---|
 | `VITE_STRIPE_PUBLISHABLE_KEY` | Stripe **publishable** key (`pk_...`) |
-| `VITE_DEMO_USER_ID` | UUID from the `users` table; stands in for a session |
 | `VITE_PRICE_*` | Stripe price ids, one per plan |
 | `VITE_DEV_PROXY_TARGET` | Where the dev server forwards `/api` (default `http://localhost:8080`) |
 | `VITE_API_BASE_URL` | Absolute backend URL. Leave empty to use the dev proxy |
@@ -48,6 +47,23 @@ src/
     ├── stripe.ts        loadStripe once, at module scope
     └── format.ts        money and date formatting
 ```
+
+## Authentication
+
+`AuthProvider` holds the session; `AuthForm` handles register and sign-in. The
+token goes into `localStorage` and is attached as `Authorization: Bearer` by the
+API client, which is told about the token through an injected bridge rather than
+importing the store — moving to an httpOnly cookie later changes the provider,
+not the client.
+
+A `401` on any authenticated call clears the session once, centrally, so no
+caller has to handle expiry. A stored token is verified against `/auth/me` on
+load, so the UI never renders a signed-in shell whose every request then fails.
+
+`localStorage` is readable by any script on the origin: one XSS is a stolen
+credential. What makes it acceptable rather than merely convenient is that the
+token is short-lived and carries no privilege beyond the subject. The upgrade is
+a refresh token in an httpOnly cookie with the access token in memory only.
 
 ## Why embedded Checkout and not a bare PaymentElement
 

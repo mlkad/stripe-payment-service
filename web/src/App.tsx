@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Plan } from "@/api/types";
+import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { useSubscription } from "@/hooks/useSubscription";
+import { AuthForm } from "@/components/AuthForm";
 import { Dashboard } from "@/components/Dashboard";
 import { PricingTable } from "@/components/PricingTable";
 import { CheckoutModal } from "@/components/CheckoutModal";
-import { Alert, Button } from "@/components/ui";
+import { Alert, Button, Spinner } from "@/components/ui";
 
 /**
  * Plan copy lives in the frontend; prices live in Stripe. Only priceId crosses
@@ -57,36 +59,16 @@ const PLANS: Plan[] = [
   },
 ];
 
-/** Stand-in for a session. Replace with the authenticated user's id. */
-const DEMO_USER_ID = import.meta.env.VITE_DEMO_USER_ID ?? "";
-
 export default function App() {
-  const [checkoutSecret, setCheckoutSecret] = useState<string | null>(null);
-  const [showPricing, setShowPricing] = useState(false);
-
-  // Stripe sends the browser back here after checkout. The local row is written
-  // by the webhook, not the redirect, so arriving with a session_id means "poll
-  // until the webhook lands" rather than "you are subscribed".
-  const [returnedFromCheckout] = useState(
-    () => new URLSearchParams(window.location.search).has("session_id"),
+  return (
+    <AuthProvider>
+      <Shell />
+    </AuthProvider>
   );
+}
 
-  const { state, refresh, isRefreshing } = useSubscription(DEMO_USER_ID, returnedFromCheckout);
-
-  useEffect(() => {
-    if (!returnedFromCheckout) return;
-    // Drop session_id from the URL so a reload does not restart polling.
-    window.history.replaceState({}, "", window.location.pathname);
-  }, [returnedFromCheckout]);
-
-  const closeCheckout = useCallback(() => {
-    setCheckoutSecret(null);
-    // The webhook may already have landed while the modal was open.
-    refresh();
-  }, [refresh]);
-
-  const hasSubscription = state.status === "ready" && state.subscription !== null;
-  const pricingVisible = showPricing || !hasSubscription;
+function Shell() {
+  const { user, isAuthenticated, isBootstrapping, logout } = useAuth();
 
   return (
     <div className="min-h-dvh">
@@ -98,58 +80,99 @@ export default function App() {
             </div>
             <span className="font-semibold tracking-tight">Stripe Gateway</span>
           </div>
-          {hasSubscription && (
-            <Button variant="ghost" onClick={() => setShowPricing((v) => !v)}>
-              {showPricing ? "Hide plans" : "Change plan"}
-            </Button>
+
+          {isAuthenticated && user && (
+            <div className="flex items-center gap-4">
+              <span className="hidden text-sm text-muted sm:inline">{user.email}</span>
+              <Button variant="ghost" onClick={logout}>
+                Sign out
+              </Button>
+            </div>
           )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl space-y-10 px-6 py-10 sm:py-14">
-        {!DEMO_USER_ID && (
-          <Alert title="No user configured" tone="warn">
-            Set <code className="font-mono">VITE_DEMO_USER_ID</code> in{" "}
-            <code className="font-mono">web/.env</code> to a UUID from the{" "}
-            <code className="font-mono">users</code> table. Until authentication exists, the UI has
-            no other way to identify the caller.
-          </Alert>
-        )}
-
-        {returnedFromCheckout && !hasSubscription && (
-          <Alert title="Finishing up" tone="info">
-            Payment received. Waiting for Stripe to confirm the subscription — this usually takes a
-            second.
-          </Alert>
-        )}
-
-        {DEMO_USER_ID && (
-          <Dashboard
-            state={state}
-            isRefreshing={isRefreshing}
-            onRefresh={refresh}
-            onChoosePlan={() => setShowPricing(true)}
-          />
-        )}
-
-        {DEMO_USER_ID && pricingVisible && (
-          <PricingTable
-            userId={DEMO_USER_ID}
-            plans={PLANS}
-            currentPriceId={
-              state.status === "ready" && state.subscription?.is_active
-                ? state.subscription.price_id
-                : undefined
-            }
-            mode="embedded"
-            onEmbeddedSession={setCheckoutSecret}
-          />
+      <main className="mx-auto max-w-5xl px-6 py-10 sm:py-14">
+        {isBootstrapping ? (
+          <div className="flex justify-center py-24" aria-busy="true">
+            <Spinner className="size-6 text-faint" />
+          </div>
+        ) : isAuthenticated ? (
+          <Billing />
+        ) : (
+          <AuthForm />
         )}
       </main>
+    </div>
+  );
+}
 
-      {checkoutSecret && (
-        <CheckoutModal clientSecret={checkoutSecret} onClose={closeCheckout} />
+function Billing() {
+  const [checkoutSecret, setCheckoutSecret] = useState<string | null>(null);
+  const [showPricing, setShowPricing] = useState(false);
+
+  // Stripe returns the browser here the moment payment succeeds, but the local
+  // row is written by the webhook. Arriving with a session_id means "poll until
+  // the webhook lands", not "you are subscribed".
+  const [returnedFromCheckout] = useState(
+    () => new URLSearchParams(window.location.search).has("session_id"),
+  );
+
+  const { state, refresh, isRefreshing } = useSubscription(returnedFromCheckout);
+
+  useEffect(() => {
+    if (!returnedFromCheckout) return;
+    // Drop session_id from the URL so a reload does not restart polling.
+    window.history.replaceState({}, "", window.location.pathname);
+  }, [returnedFromCheckout]);
+
+  const closeCheckout = useCallback(() => {
+    setCheckoutSecret(null);
+    // The webhook may have landed while the modal was open.
+    refresh();
+  }, [refresh]);
+
+  const hasSubscription = state.status === "ready" && state.subscription !== null;
+  const pricingVisible = showPricing || !hasSubscription;
+
+  return (
+    <div className="space-y-10">
+      {returnedFromCheckout && !hasSubscription && (
+        <Alert title="Finishing up" tone="info">
+          Payment received. Waiting for Stripe to confirm the subscription — this usually takes a
+          second.
+        </Alert>
       )}
+
+      <Dashboard
+        state={state}
+        isRefreshing={isRefreshing}
+        onRefresh={refresh}
+        onChoosePlan={() => setShowPricing(true)}
+      />
+
+      {hasSubscription && (
+        <div className="flex justify-end">
+          <Button variant="ghost" onClick={() => setShowPricing((v) => !v)}>
+            {showPricing ? "Hide plans" : "Change plan"}
+          </Button>
+        </div>
+      )}
+
+      {pricingVisible && (
+        <PricingTable
+          plans={PLANS}
+          currentPriceId={
+            state.status === "ready" && state.subscription?.is_active
+              ? state.subscription.price_id
+              : undefined
+          }
+          mode="embedded"
+          onEmbeddedSession={setCheckoutSecret}
+        />
+      )}
+
+      {checkoutSecret && <CheckoutModal clientSecret={checkoutSecret} onClose={closeCheckout} />}
     </div>
   );
 }

@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/google/uuid"
 	"time"
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
@@ -16,9 +18,12 @@ import (
 	"github.com/mlkad/stripe-payment-service/internal/service"
 )
 
-func getSubscription(t *testing.T, h http.Handler, userID string) *httptest.ResponseRecorder {
+// getSubscription calls the endpoint as the given user. There is no user_id
+// parameter any more: the subject comes from the token.
+func getSubscription(t *testing.T, h http.Handler, userID uuid.UUID) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodGet, "/api/v1/subscription?user_id="+url.QueryEscape(userID), nil)
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/subscription", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenFor(t, userID))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	return rec
@@ -32,7 +37,7 @@ func TestSubscriptionAPI_NoSubscriptionIs404(t *testing.T) {
 	_, h := newWebhookStack(t)
 	u := seedUserWithCustomer(t, "nosub@example.com", "cus_NoSub0001")
 
-	rec := getSubscription(t, h, u.ID.String())
+	rec := getSubscription(t, h, u.ID)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -45,13 +50,32 @@ func TestSubscriptionAPI_NoSubscriptionIs404(t *testing.T) {
 	}
 }
 
-func TestSubscriptionAPI_RejectsMalformedUserID(t *testing.T) {
+// A stale client still sending ?user_id= must have it ignored, not honoured.
+// The parameter no longer exists, so pointing it at another user changes
+// nothing about whose data comes back.
+func TestSubscriptionAPI_QueryParameterIsIgnored(t *testing.T) {
 	truncate(t)
 	_, h := newWebhookStack(t)
 
-	for _, id := range []string{"", "not-a-uuid", "'; DROP TABLE users; --"} {
-		if rec := getSubscription(t, h, id); rec.Code != http.StatusBadRequest {
-			t.Errorf("user_id=%q: status = %d, want 400", id, rec.Code)
+	owner, _ := seedSubscription(t, "sub_Ignored0001")
+	stranger := uuid.New()
+
+	for _, spoofed := range []string{
+		owner.UserID.String(),
+		stranger.String(),
+		"not-a-uuid",
+		"'; DROP TABLE users; --",
+	} {
+		r := httptest.NewRequest(http.MethodGet,
+			"/api/v1/subscription?user_id="+url.QueryEscape(spoofed), nil)
+		// Authenticated as the stranger, who has no subscription.
+		r.Header.Set("Authorization", "Bearer "+tokenFor(t, stranger))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("user_id=%q: status = %d, want 404 - the parameter was honoured (body: %s)",
+				spoofed, rec.Code, rec.Body)
 		}
 	}
 }
@@ -64,7 +88,7 @@ func TestSubscriptionAPI_ViewWithholdsInternalFields(t *testing.T) {
 	_, h := newWebhookStack(t)
 	sub, _ := seedSubscription(t, "sub_View00001")
 
-	rec := getSubscription(t, h, sub.UserID.String())
+	rec := getSubscription(t, h, sub.UserID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
 	}
@@ -106,7 +130,7 @@ func TestSubscriptionAPI_CanceledSubscriptionStillReturns200(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 
-	rec := getSubscription(t, h, sub.UserID.String())
+	rec := getSubscription(t, h, sub.UserID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: a lapsed subscriber is not the same as a new one", rec.Code)
 	}

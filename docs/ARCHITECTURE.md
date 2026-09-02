@@ -59,6 +59,10 @@ stripe-payment-service/
 │   │       ├── subscription_repo.go
 │   │       └── webhook_repo.go     #    claim / settle idempotency
 │   │
+│   ├── auth/                       # ── credential primitives, zero I/O ──
+│   │   ├── password.go             #    bcrypt policy, hashing, decoy compare
+│   │   └── token.go                #    JWT issue/parse, pinned algorithm
+│   │
 │   ├── stripe/                     # ── the only package importing stripe-go ──
 │   │   └── client.go               #    checkout, subscription reads, signature
 │   │                               #    verification, error classification
@@ -208,6 +212,77 @@ That leaves one gap by construction: a handler that ignores its context cannot
 be interrupted this way. `http.Server.WriteTimeout` is the backstop, which is
 why config refuses to start when a request deadline is longer than it —
 otherwise the connection is torn down before the middleware can answer.
+
+## Authentication
+
+Every route under `/api/v1` except `auth/register` and `auth/login` requires a
+bearer token. `RequireAuth` is applied to a chi group rather than per route, so
+a new endpoint is protected by default rather than by remembering.
+
+**No handler accepts an identity from the client.** The subject comes from the
+verified token via `middleware.UserIDFromContext`. Both fields that used to
+carry it are gone: `checkoutRequest` has no `user_id`, and the subscription
+route has no `user_id` parameter. Because the decoder sets
+`DisallowUnknownFields`, a stale client still sending one now gets a `400`
+rather than being silently ignored — the failure is loud on the client side and
+harmless on the server side.
+
+The context key is unexported, so nothing outside `middleware` can write an
+authenticated subject. A handler on a route that was never wrapped therefore
+gets an error rather than a zero uuid it might mistake for a user, and answers
+**500, not 401**. A 401 there would be indistinguishable from a genuine missing
+token, which would make an endpoint accidentally mounted outside `RequireAuth`
+look protected while enforcing nothing.
+
+### Login does not disclose whether an account exists
+
+Both "no such user" and "wrong password" return the same status and the same
+body, and both spend a full bcrypt comparison — the unknown-account path
+compares against a decoy digest rather than returning early.
+
+The decoy is generated at the configured cost, not hardcoded. That detail is
+load-bearing: an earlier version used a fixed cost-12 digest, and against
+cost-10 stored hashes it produced **294ms for an unknown account versus 65ms for
+a wrong password** — a louder oracle than having no decoy at all. Measured live,
+not reasoned about. After the fix both paths sit at ~65ms.
+
+### Password policy
+
+`MaxPasswordBytes` is 72 because bcrypt silently truncates there. Accepting
+longer input would mean two passwords sharing a 72-byte prefix authenticate each
+other, with no way for the user to know their tail was discarded. The limit is
+measured in bytes, not runes: 40 accented characters exceed it.
+
+Cost upgrades ride along on successful login, which is the only moment the
+plaintext is available.
+
+### Token handling
+
+HS256, with the issuer and audience verified on every parse so a token minted
+for staging cannot be replayed against production. `WithValidMethods` pins the
+algorithm as defence in depth — jwt/v5 refuses `alg:none` on its own, and the
+keyfunc always returns `[]byte`, so an RS256 header fails on key type before any
+signature check. The allowlist is what keeps that true if the keyfunc ever
+returns more than one key type.
+
+Every parse failure except expiry collapses to one error. A caller has no
+legitimate use for the distinction between a bad signature, a wrong audience and
+a malformed segment, and reporting it tells a forger which part to fix next.
+
+**Tokens are stateless and cannot be revoked before they expire.** That is the
+reason the TTL is short rather than a reason to be relaxed about it, and config
+refuses a TTL over 24h in production. Adding revocation means a store keyed on
+the `jti` claim, which is already minted for that purpose.
+
+### What this step does not do
+
+- No refresh tokens. The frontend holds the access token in `localStorage`,
+  where any script on the origin can read it; a single XSS is a stolen
+  credential. The upgrade is a refresh token in an httpOnly cookie with the
+  access token held in memory only.
+- No rate limiting on `login` or `register`. bcrypt at cost 12 makes online
+  guessing slow, but it makes the endpoint a cheap way to burn server CPU.
+- No password reset, email verification, or account lockout.
 
 ## Query contracts the repository layer must honour
 
