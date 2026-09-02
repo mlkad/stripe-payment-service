@@ -114,6 +114,23 @@ jobs:
       - name: Integration tests
         run: go test -race -count=1 -tags=integration ./test/integration/...
 
+      # Combined coverage across unit and integration, since a lot of the
+      # repository and handler code is only reachable with a database. The gate
+      # is set below the current figure on purpose: it exists to catch a real
+      # regression, not to fail on a percentage point of noise.
+      - name: Coverage gate
+        env:
+          MINIMUM: 70
+        run: |
+          go test -count=1 -tags=integration \
+            -coverpkg=./internal/... -coverprofile=coverage.out ./... > /dev/null
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print substr($3, 1, length($3)-1)}')
+          echo "combined coverage: ${total}%"
+          awk -v t="$total" -v m="$MINIMUM" 'BEGIN { exit (t+0 >= m+0) ? 0 : 1 }' || {
+            echo "::error::coverage ${total}% is below the ${MINIMUM}% gate"
+            exit 1
+          }
+
       - name: Migrations roll back cleanly
         env:
           GOOSE_DRIVER: postgres
