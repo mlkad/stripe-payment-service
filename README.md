@@ -116,5 +116,6 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 7** — JWT authentication, protected routes, secure context
 - [x] **Step 8** — auth rate limiting, invoice events, dunning state
 - [x] **Step 9** — Customer Portal, CI pipeline
-- [ ] **Step 10** — failed-webhook alerting, payload retention, refresh tokens
-- [ ] **Step 11** — observability, deployment
+- [x] **Step 10** — webhook sweeper: dead-letter recovery and alerting
+- [ ] **Step 11** — payload retention, refresh tokens, unit test coverage
+- [ ] **Step 12** — observability, deployment

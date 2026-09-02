@@ -29,6 +29,7 @@ import (
 	"github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
+	"github.com/mlkad/stripe-payment-service/internal/worker"
 )
 
 // Injected at build time via -ldflags.
@@ -40,8 +41,10 @@ var (
 
 func main() {
 	var (
-		healthcheck = flag.Bool("healthcheck", false, "probe the local liveness endpoint and exit; used by the container HEALTHCHECK")
-		showVersion = flag.Bool("version", false, "print version information and exit")
+		healthcheck   = flag.Bool("healthcheck", false, "probe the local liveness endpoint and exit; used by the container HEALTHCHECK")
+		showVersion   = flag.Bool("version", false, "print version information and exit")
+		webhookReport = flag.Bool("webhook-report", false, "print the unsettled webhook ledger and exit")
+		webhookSweep  = flag.Bool("webhook-sweep", false, "run one webhook sweep and exit")
 	)
 	flag.Parse()
 
@@ -52,6 +55,14 @@ func main() {
 	if *healthcheck {
 		if err := probe(); err != nil {
 			fmt.Fprintln(os.Stderr, "healthcheck failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *webhookReport || *webhookSweep {
+		if err := runWebhookTool(*webhookSweep); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 		return
@@ -168,6 +179,15 @@ func run() error {
 	}, log)
 	defer authRateLimiter.Close()
 
+	if cfg.Sweeper.Enabled {
+		sweeper := worker.NewWebhookSweeper(webhookRepo, webhookService, sweeperConfig(cfg), log)
+		// Bound by signalCtx so the sweeper stops as soon as shutdown begins,
+		// rather than starting a batch the drain would then wait on.
+		go sweeper.Run(signalCtx)
+	} else {
+		log.Warn("webhook sweeper is disabled; failed events will not be retried or reported")
+	}
+
 	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
 	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, log)
 	authHandler := handler.NewAuthHandler(authService, log)
@@ -240,6 +260,116 @@ func run() error {
 
 	log.Info("http server drained")
 	return nil
+}
+
+func sweeperConfig(cfg *config.Config) worker.SweeperConfig {
+	return worker.SweeperConfig{
+		Interval:        cfg.Sweeper.Interval,
+		StaleClaimAfter: cfg.Sweeper.StaleClaimAfter,
+		MaxAttempts:     int32(cfg.Sweeper.MaxAttempts),
+		BaseBackoff:     cfg.Sweeper.BaseBackoff,
+		MaxBackoff:      cfg.Sweeper.MaxBackoff,
+		BatchSize:       cfg.Sweeper.BatchSize,
+		AlertAfter:      cfg.Sweeper.AlertAfter,
+	}
+}
+
+// runWebhookTool backs -webhook-report and -webhook-sweep.
+//
+// A CLI rather than an HTTP route on purpose: an admin endpoint needs an
+// authorisation model this service does not have, and inventing one to expose
+// diagnostics would be a larger security surface than the diagnostics are
+// worth. This runs with the same configuration and database access as the
+// service, which is what an operator or a cron job already has.
+func runWebhookTool(sweep bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load configuration: %w", err)
+	}
+	log, err := logger.New(logger.Options{
+		Level: cfg.Log.Level, Format: cfg.Log.Format,
+		Service: cfg.App.Name, Environment: string(cfg.App.Environment), Version: version,
+	})
+	if err != nil {
+		return fmt.Errorf("build logger: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	db, err := database.New(ctx, database.Config{
+		DSN:              cfg.Database.DSN.Reveal(),
+		MaxConns:         4,
+		MinConns:         1,
+		ConnectTimeout:   cfg.Database.ConnectTimeout,
+		StatementTimeout: cfg.Database.StatementTimeout,
+		ApplicationName:  cfg.App.Name + "-webhook-tool",
+	}, log)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer db.Close()
+
+	webhookRepo := postgres.NewWebhookRepo(db.Pool(), cfg.Sweeper.StaleClaimAfter)
+
+	if !sweep {
+		stats, err := webhookRepo.LedgerStats(ctx, int32(cfg.Sweeper.MaxAttempts))
+		if err != nil {
+			return fmt.Errorf("read ledger: %w", err)
+		}
+		printLedger(stats)
+		// Non-zero exit when a human is needed, so a cron entry or a monitoring
+		// check can act on it without parsing the output.
+		if stats.DeadLettered > 0 {
+			os.Exit(2)
+		}
+		return nil
+	}
+
+	stripeClient, err := paystripe.New(paystripe.Config{
+		SecretKey:                cfg.Stripe.SecretKey.Reveal(),
+		WebhookSecret:            cfg.Stripe.WebhookSecret.Reveal(),
+		APIVersion:               cfg.Stripe.APIVersion,
+		MaxNetworkRetries:        cfg.Stripe.MaxNetworkRetries,
+		HTTPTimeout:              cfg.Stripe.HTTPTimeout,
+		WebhookTolerance:         cfg.Stripe.WebhookTolerance,
+		IgnoreAPIVersionMismatch: cfg.Stripe.IgnoreAPIVersionMismatch,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("build stripe client: %w", err)
+	}
+
+	webhookService := service.NewWebhookService(
+		postgres.NewUserRepo(db.Pool()),
+		postgres.NewSubscriptionRepo(db.Pool()),
+		webhookRepo, stripeClient, log)
+
+	result := worker.NewWebhookSweeper(webhookRepo, webhookService, sweeperConfig(cfg), log).Sweep(ctx)
+	fmt.Printf("reclaimed %d, retried %d, recovered %d\n",
+		result.Reclaimed, result.Retried, result.Recovered)
+	printLedger(result.Stats)
+	if result.Stats.DeadLettered > 0 {
+		os.Exit(2)
+	}
+	return nil
+}
+
+func printLedger(stats postgres.LedgerStats) {
+	fmt.Printf("processing    %d\n", stats.Processing)
+	fmt.Printf("retryable     %d\n", stats.Retryable)
+	fmt.Printf("dead-lettered %d\n", stats.DeadLettered)
+	if stats.OldestUnsettled != nil {
+		fmt.Printf("oldest        %s (%s ago)\n",
+			stats.OldestUnsettled.Format(time.RFC3339),
+			time.Since(*stats.OldestUnsettled).Truncate(time.Second))
+	}
+	if stats.DeadLettered > 0 {
+		fmt.Println("\nDead-lettered events will not be retried again. Inspect them with:")
+		fmt.Println("  SELECT event_id, event_type, attempts, last_error, updated_at")
+		fmt.Println("  FROM processed_webhooks WHERE status = 'failed' ORDER BY updated_at;")
+		fmt.Println("\nAfter fixing the cause, reset their attempt count to make them retryable:")
+		fmt.Println("  UPDATE processed_webhooks SET attempts = 0 WHERE event_id = '...';")
+	}
 }
 
 // probe backs the container HEALTHCHECK. It targets liveness rather than

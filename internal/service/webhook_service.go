@@ -159,6 +159,76 @@ func (s *WebhookService) ProcessEvent(ctx context.Context, payload []byte, signa
 	return outcome, nil
 }
 
+// ReplayEvent re-runs a stored event through the dispatch path.
+//
+// It does NOT verify a signature, because there is none to verify: the
+// Stripe-Signature header is not stored, and the payload was already
+// authenticated when the event first arrived. That is safe only because the
+// argument comes from the ledger, and a row reaches the ledger only through
+// ProcessEvent, which verifies before it claims.
+//
+// This must therefore never be reachable from a request handler, and no
+// caller may construct a ProcessedWebhook from user input and pass it here.
+// Doing so would reintroduce exactly the forgery ProcessEvent exists to
+// prevent. Its only caller is the sweeper.
+//
+// The caller is expected to already hold the claim - ClaimEventForRetry moves
+// the row to 'processing' - so this settles but does not claim.
+func (s *WebhookService) ReplayEvent(ctx context.Context, record *domain.ProcessedWebhook) (Outcome, error) {
+	log := s.log.With(
+		slog.String("event_id", record.EventID),
+		slog.String("event_type", record.EventType),
+		slog.Int("attempt", int(record.Attempts)),
+		slog.Bool("replay", true),
+	)
+
+	if len(record.Payload) == 0 {
+		// The payload column is nullable and subject to a retention policy, so
+		// an old event may have been pruned. There is nothing to replay, and
+		// leaving it 'processing' would strand it.
+		if err := s.hooks.MarkEventSkipped(ctx, record.EventID, "payload no longer retained; cannot replay"); err != nil {
+			log.ErrorContext(ctx, "could not settle an unreplayable event", slog.String("error", err.Error()))
+		}
+		log.WarnContext(ctx, "event has no stored payload, skipping replay")
+		return OutcomeSkipped, nil
+	}
+
+	var event stripesdk.Event
+	if err := json.Unmarshal(record.Payload, &event); err != nil {
+		// Stored bytes that will never parse. Retrying forever accomplishes
+		// nothing, so settle it as skipped and let the report surface it.
+		if markErr := s.hooks.MarkEventSkipped(ctx, record.EventID, "stored payload is not valid Stripe event JSON"); markErr != nil {
+			log.ErrorContext(ctx, "could not settle an unparseable event", slog.String("error", markErr.Error()))
+		}
+		log.ErrorContext(ctx, "stored payload could not be parsed", slog.String("error", err.Error()))
+		return OutcomeSkipped, nil
+	}
+
+	if !handledEventTypes[event.Type] {
+		return s.settleSkipped(ctx, log, record.EventID, "event type not subscribed")
+	}
+
+	outcome, err := s.dispatch(ctx, log, event)
+	if err != nil {
+		if markErr := s.hooks.MarkEventFailed(ctx, record.EventID, err); markErr != nil {
+			log.ErrorContext(ctx, "could not record replay failure", slog.String("error", markErr.Error()))
+		}
+		log.WarnContext(ctx, "replay failed",
+			slog.String("error", err.Error()),
+			slog.Bool("retryable", paystripe.IsRetryable(err)))
+		return OutcomeFailed, err
+	}
+
+	if outcome == OutcomeSkipped {
+		return s.settleSkipped(ctx, log, record.EventID, "no action required for this event")
+	}
+	if err := s.hooks.MarkEventProcessed(ctx, record.EventID); err != nil {
+		log.ErrorContext(ctx, "replay succeeded but ledger not settled", slog.String("error", err.Error()))
+	}
+	log.InfoContext(ctx, "event replayed", slog.String("outcome", string(outcome)))
+	return outcome, nil
+}
+
 func (s *WebhookService) settleSkipped(ctx context.Context, log *slog.Logger, eventID, reason string) (Outcome, error) {
 	if err := s.hooks.MarkEventSkipped(ctx, eventID, reason); err != nil {
 		log.ErrorContext(ctx, "could not mark event skipped", slog.String("error", err.Error()))
