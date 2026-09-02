@@ -92,8 +92,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Pinned, not @latest. setup-go sets GOTOOLCHAIN=local, so a goose
+      # release that requires a newer Go than go.mod declares cannot be built
+      # and fails the job - which is exactly what @latest did here when
+      # v3.28.0 started requiring Go 1.26.
       - name: Install goose
-        run: go install github.com/pressly/goose/v3/cmd/goose@latest
+        run: go install github.com/pressly/goose/v3/cmd/goose@v3.27.0
 
       - name: Run migrations
         env:
