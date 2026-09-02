@@ -46,6 +46,55 @@ type WebhookRepository interface {
 
 	// LedgerStats summarises the unsettled backlog.
 	LedgerStats(ctx context.Context, maxAttempts int32) (LedgerStats, error)
+
+	// PurgePayloads reduces stored event payloads to a non-identifying
+	// skeleton once they are past their retention window.
+	PurgePayloads(ctx context.Context, in PurgeQuery) (PurgeResult, error)
+
+	// RetentionStats reports how much personal data is still held.
+	RetentionStats(ctx context.Context, in PurgeQuery) (RetentionStats, error)
+}
+
+// PurgeQuery bounds one retention pass.
+type PurgeQuery struct {
+	// SettledAfter is how long a succeeded or skipped event keeps its payload.
+	// These have no replay value left; the window exists only so an operator
+	// can investigate something that went wrong recently.
+	SettledAfter time.Duration
+
+	// UnsettledAfter is the outer bound for a failed event. Not optional: a
+	// privacy obligation does not pause because a retry queue is stuck, and
+	// without it one permanently dead-lettered event holds personal data
+	// forever. It must comfortably exceed the time the sweeper needs to
+	// exhaust its retry budget, or recoverable events lose their payload.
+	UnsettledAfter time.Duration
+
+	Limit int
+}
+
+// PurgeResult is what one pass removed.
+type PurgeResult struct {
+	Settled   int
+	Unsettled int
+}
+
+func (r PurgeResult) Total() int { return r.Settled + r.Unsettled }
+
+// RetentionStats describes the personal data still held.
+type RetentionStats struct {
+	// WithPayload is rows still holding a full event.
+	WithPayload int64
+
+	// Purged is rows already reduced to their skeleton.
+	Purged int64
+
+	// DueNow is rows past their window and awaiting the next pass. A number
+	// that does not fall means retention is not running.
+	DueNow int64
+
+	// OldestPayload is the age of the oldest full event still stored. This is
+	// the number a data protection review asks for.
+	OldestPayload *time.Time
 }
 
 // RetryQuery bounds a sweep for retryable events.
@@ -359,6 +408,111 @@ func (r *WebhookRepo) LedgerStats(ctx context.Context, maxAttempts int32) (Ledge
 
 // Unsettled reports whether anything needs attention.
 func (s LedgerStats) Unsettled() int64 { return s.Processing + s.Retryable + s.DeadLettered }
+
+// payloadSkeleton is the allowlist that replaces a purged payload.
+//
+// Built in SQL on purpose: the personal data is reduced in place and never
+// travels to the application, so a purge cannot leak through a log line, a
+// crash dump, or a debugger on the way past.
+//
+// An allowlist rather than a redaction. Stripping known-sensitive fields would
+// start leaking the day Stripe adds a field nobody anticipated, and it would
+// look compliant while doing it. This keeps only what identifies the event
+// itself - never anything describing the person it concerns.
+const payloadSkeleton = `
+	jsonb_strip_nulls(jsonb_build_object(
+		'id',          payload -> 'id',
+		'object',      payload -> 'object',
+		'type',        payload -> 'type',
+		'created',     payload -> 'created',
+		'livemode',    payload -> 'livemode',
+		'api_version', payload -> 'api_version',
+		'data', jsonb_build_object('object', jsonb_strip_nulls(jsonb_build_object(
+			'id',     payload #> '{data,object,id}',
+			'object', payload #> '{data,object,object}'
+		)))
+	))`
+
+// PurgePayloads applies the retention policy.
+//
+// Rows in 'processing' are never touched: the sweeper may be mid-replay, and
+// taking the payload out from under it would turn a recoverable event into an
+// unreplayable one. They become eligible once the sweeper reclaims them.
+//
+// The UPDATE moves updated_at, because trg_processed_webhooks_set_updated_at
+// owns that column. That is harmless here - settled rows do not use it, and an
+// unsettled row this old has long since exhausted its retry budget - but it is
+// the reason UnsettledAfter must stay far larger than the sweeper's backoff.
+func (r *WebhookRepo) PurgePayloads(ctx context.Context, in PurgeQuery) (PurgeResult, error) {
+	const query = `
+		UPDATE processed_webhooks
+		SET payload = ` + payloadSkeleton + `,
+		    payload_purged_at = now()
+		WHERE event_id IN (
+			SELECT event_id FROM processed_webhooks
+			WHERE payload IS NOT NULL
+			  AND payload_purged_at IS NULL
+			  AND status <> 'processing'
+			  AND (
+			        (status IN ('succeeded', 'skipped')
+			           AND received_at < now() - make_interval(secs => $1))
+			     OR (status = 'failed'
+			           AND received_at < now() - make_interval(secs => $2))
+			  )
+			ORDER BY received_at
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING status::text`
+
+	rows, err := r.pool.Query(ctx, query,
+		in.SettledAfter.Seconds(), in.UnsettledAfter.Seconds(), in.Limit)
+	if err != nil {
+		return PurgeResult{}, mapError("purge payloads", err)
+	}
+	defer rows.Close()
+
+	var result PurgeResult
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			return PurgeResult{}, mapError("purge payloads: scan", err)
+		}
+		if status == string(domain.WebhookFailed) {
+			result.Unsettled++
+		} else {
+			result.Settled++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return PurgeResult{}, mapError("purge payloads: iterate", err)
+	}
+	return result, nil
+}
+
+func (r *WebhookRepo) RetentionStats(ctx context.Context, in PurgeQuery) (RetentionStats, error) {
+	const query = `
+		SELECT
+			count(*) FILTER (WHERE payload IS NOT NULL AND payload_purged_at IS NULL),
+			count(*) FILTER (WHERE payload_purged_at IS NOT NULL),
+			count(*) FILTER (WHERE payload IS NOT NULL
+			                   AND payload_purged_at IS NULL
+			                   AND status <> 'processing'
+			                   AND ((status IN ('succeeded','skipped')
+			                           AND received_at < now() - make_interval(secs => $1))
+			                     OR (status = 'failed'
+			                           AND received_at < now() - make_interval(secs => $2)))),
+			min(received_at) FILTER (WHERE payload IS NOT NULL AND payload_purged_at IS NULL)
+		FROM processed_webhooks`
+
+	var stats RetentionStats
+	err := r.pool.QueryRow(ctx, query, in.SettledAfter.Seconds(), in.UnsettledAfter.Seconds()).
+		Scan(&stats.WithPayload, &stats.Purged, &stats.DueNow, &stats.OldestPayload)
+	if err != nil {
+		return RetentionStats{}, mapError("retention stats", err)
+	}
+	return stats, nil
+}
 
 const webhookColumns = `
 	event_id, event_type, api_version, livemode, request_id,

@@ -418,6 +418,65 @@ A CLI rather than an HTTP route on purpose: an admin endpoint needs an
 authorisation model this service does not have, and inventing one to expose
 diagnostics would be a larger security surface than the diagnostics are worth.
 
+## Payload retention and data minimisation
+
+`processed_webhooks.payload` holds the raw Stripe event: customer email, name,
+postal address, phone, and card metadata. Keeping it indefinitely is a growing
+table and a growing liability — under GDPR, storage has to be limited to what
+the purpose actually requires.
+
+The purpose is replay. The sweeper reconstructs a failed event from exactly
+this column, so the payload cannot be dropped on a fixed clock. Two windows
+follow:
+
+| Status | Window | Why |
+|---|---|---|
+| `succeeded`, `skipped` | 30 days | No replay value left; long enough to investigate last month's incident |
+| `failed` | 90 days | The sweeper still needs it — but not forever |
+| `processing` | never purged | A replay may be in flight right now |
+
+**The outer bound on failed events is the part that is easy to leave out, and
+must not be.** A privacy obligation does not pause because a retry queue is
+stuck; without it, one permanently dead-lettered event holds personal data
+indefinitely. When it fires, the pass logs a warning — the data had to go, but
+losing replayability is a real consequence and should not be silent.
+
+### Allowlist, not redaction
+
+What replaces the payload is an allowlisted skeleton: `id`, `object`, `type`,
+`created`, `livemode`, `api_version`, and the event object's `id` and `object`.
+Enough to say what the event was; nothing describing the person it concerned.
+
+A denylist that stripped known-sensitive fields would start leaking the day
+Stripe adds a field nobody anticipated — and it would look compliant while doing
+it. An allowlist can only ever be too conservative.
+
+The reduction is done in SQL, so the personal data is minimised in place and
+never travels to the application, where it could reach a log line, a crash
+dump, or a debugger on the way past.
+
+### Enforced by the database, not only the code
+
+`processed_webhooks_purged_payload_chk` rejects any row marked
+`payload_purged_at` that still carries `customer_details`, `billing_details`,
+or `customer_email`. A bug that re-populates the column fails loudly instead of
+quietly restoring personal data.
+
+`payload_purged_at` is the evidence trail: an auditor asking "prove you delete
+this" needs a better answer than "trust the cron job".
+
+### Config refuses configurations that would lose data
+
+`PAYLOAD_RETENTION_UNSETTLED_AFTER` must exceed the sweeper's retry budget by a
+wide margin, or failed events lose their payload before anything can replay
+them. Production also refuses to start with retention disabled.
+
+### Operator surface
+
+`api -retention-run` performs one pass, reports what remains, and exits **2**
+when anything is still past its window — so a compliance check can act without
+parsing output.
+
 ## Rate limiting
 
 Applied to `POST /api/v1/auth/login` and `/register` only. Those are the only

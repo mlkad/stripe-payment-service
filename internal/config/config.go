@@ -71,13 +71,14 @@ func (e Environment) valid() bool {
 
 // Config is the fully validated configuration for the process.
 type Config struct {
-	App      App
-	HTTP     HTTP
-	Database Database
-	Stripe   Stripe
-	Auth     Auth
-	Sweeper  Sweeper
-	Log      Log
+	App       App
+	HTTP      HTTP
+	Database  Database
+	Stripe    Stripe
+	Auth      Auth
+	Sweeper   Sweeper
+	Retention Retention
+	Log       Log
 }
 
 type Auth struct {
@@ -201,6 +202,23 @@ type Sweeper struct {
 	AlertAfter time.Duration
 }
 
+// Retention configures data minimisation on stored webhook payloads.
+type Retention struct {
+	Enabled  bool
+	Interval time.Duration
+
+	// SettledPayloadAfter is how long a succeeded or skipped event keeps its
+	// payload.
+	SettledPayloadAfter time.Duration
+
+	// UnsettledPayloadAfter is the outer bound for a failed event. It must
+	// exceed the time the sweeper needs to exhaust its retry budget, or
+	// recoverable events lose their payload before anything can replay them.
+	UnsettledPayloadAfter time.Duration
+
+	BatchSize int
+}
+
 type Log struct {
 	Level     string
 	Format    string
@@ -310,6 +328,13 @@ func Load() (*Config, error) {
 			StaleClaimAfter: l.duration("WEBHOOK_STALE_CLAIM_AFTER", 5*time.Minute),
 			AlertAfter:      l.duration("WEBHOOK_SWEEPER_ALERT_AFTER", time.Hour),
 		},
+		Retention: Retention{
+			Enabled:               l.boolVal("PAYLOAD_RETENTION_ENABLED", true),
+			Interval:              l.duration("PAYLOAD_RETENTION_INTERVAL", 6*time.Hour),
+			SettledPayloadAfter:   l.duration("PAYLOAD_RETENTION_SETTLED_AFTER", 30*24*time.Hour),
+			UnsettledPayloadAfter: l.duration("PAYLOAD_RETENTION_UNSETTLED_AFTER", 90*24*time.Hour),
+			BatchSize:             l.intVal("PAYLOAD_RETENTION_BATCH_SIZE", 500),
+		},
 		Log: Log{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
 			Format:    strings.ToLower(l.str("LOG_FORMAT", "json")),
@@ -403,6 +428,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateStripe()...)
 	errs = append(errs, c.validateAuth()...)
 	errs = append(errs, c.validateSweeper()...)
+	errs = append(errs, c.validateRetention()...)
 
 	if _, err := parseLevelName(c.Log.Level); err != nil {
 		add("LOG_LEVEL must be one of debug, info, warn, error (got %q)", c.Log.Level)
@@ -598,6 +624,54 @@ func (c *Config) validateSweeper() []error {
 		add("WEBHOOK_STALE_CLAIM_AFTER (%s) must exceed HTTP_WEBHOOK_TIMEOUT (%s), "+
 			"or the sweeper reclaims claims that are still being worked on",
 			c.Sweeper.StaleClaimAfter, c.HTTP.WebhookTimeout)
+	}
+	return errs
+}
+
+func (c *Config) validateRetention() []error {
+	var errs []error
+	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+
+	if !c.Retention.Enabled {
+		// Not an error - a deployment may minimise through some other pipeline -
+		// but it is worth refusing to let it pass unnoticed in production,
+		// where the payload column accumulates personal data indefinitely.
+		if c.App.Environment.IsProduction() {
+			add("PAYLOAD_RETENTION_ENABLED is false in production; webhook payloads " +
+				"hold customer email and billing address and would be kept indefinitely")
+		}
+		return errs
+	}
+
+	if c.Retention.Interval <= 0 {
+		add("PAYLOAD_RETENTION_INTERVAL must be positive")
+	}
+	if c.Retention.BatchSize < 1 {
+		add("PAYLOAD_RETENTION_BATCH_SIZE must be at least 1 (got %d)", c.Retention.BatchSize)
+	}
+	if c.Retention.SettledPayloadAfter <= 0 {
+		add("PAYLOAD_RETENTION_SETTLED_AFTER must be positive")
+	}
+	if c.Retention.UnsettledPayloadAfter < c.Retention.SettledPayloadAfter {
+		add("PAYLOAD_RETENTION_UNSETTLED_AFTER (%s) must not be shorter than "+
+			"PAYLOAD_RETENTION_SETTLED_AFTER (%s): an unresolved event needs its payload "+
+			"for longer than a settled one, not less",
+			c.Retention.UnsettledPayloadAfter, c.Retention.SettledPayloadAfter)
+	}
+
+	// The sweeper replays failed events from the payload. Purging one before
+	// the sweeper has finished with it turns a recoverable event into a
+	// permanently lost one, so the outer bound has to clear the retry budget by
+	// a wide margin.
+	if c.Sweeper.Enabled {
+		exhaust := time.Duration(c.Sweeper.MaxAttempts) * c.Sweeper.MaxBackoff
+		if c.Retention.UnsettledPayloadAfter < 10*exhaust {
+			add("PAYLOAD_RETENTION_UNSETTLED_AFTER (%s) is too close to the sweeper's retry "+
+				"budget (%d attempts x %s = %s); failed events would lose their payload "+
+				"before the sweeper is done with them",
+				c.Retention.UnsettledPayloadAfter, c.Sweeper.MaxAttempts,
+				c.Sweeper.MaxBackoff, exhaust)
+		}
 	}
 	return errs
 }

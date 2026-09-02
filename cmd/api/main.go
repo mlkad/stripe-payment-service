@@ -45,6 +45,7 @@ func main() {
 		showVersion   = flag.Bool("version", false, "print version information and exit")
 		webhookReport = flag.Bool("webhook-report", false, "print the unsettled webhook ledger and exit")
 		webhookSweep  = flag.Bool("webhook-sweep", false, "run one webhook sweep and exit")
+		retentionRun  = flag.Bool("retention-run", false, "run one payload retention pass and exit")
 	)
 	flag.Parse()
 
@@ -60,6 +61,13 @@ func main() {
 		return
 	}
 
+	if *retentionRun {
+		if err := runRetentionTool(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *webhookReport || *webhookSweep {
 		if err := runWebhookTool(*webhookSweep); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -179,6 +187,14 @@ func run() error {
 	}, log)
 	defer authRateLimiter.Close()
 
+	if cfg.Retention.Enabled {
+		retention := worker.NewRetentionWorker(webhookRepo, retentionConfig(cfg), log)
+		go retention.Run(signalCtx)
+	} else {
+		log.Warn("payload retention is disabled; stored webhook payloads keep customer " +
+			"email and billing address indefinitely")
+	}
+
 	if cfg.Sweeper.Enabled {
 		sweeper := worker.NewWebhookSweeper(webhookRepo, webhookService, sweeperConfig(cfg), log)
 		// Bound by signalCtx so the sweeper stops as soon as shutdown begins,
@@ -272,6 +288,74 @@ func sweeperConfig(cfg *config.Config) worker.SweeperConfig {
 		BatchSize:       cfg.Sweeper.BatchSize,
 		AlertAfter:      cfg.Sweeper.AlertAfter,
 	}
+}
+
+func retentionConfig(cfg *config.Config) worker.RetentionConfig {
+	return worker.RetentionConfig{
+		Interval:       cfg.Retention.Interval,
+		SettledAfter:   cfg.Retention.SettledPayloadAfter,
+		UnsettledAfter: cfg.Retention.UnsettledPayloadAfter,
+		BatchSize:      cfg.Retention.BatchSize,
+	}
+}
+
+// runRetentionTool backs -retention-run: one pass, then report and exit. Needs
+// no Stripe client, since minimisation happens entirely inside the database.
+func runRetentionTool() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load configuration: %w", err)
+	}
+	log, err := logger.New(logger.Options{
+		Level: cfg.Log.Level, Format: cfg.Log.Format,
+		Service: cfg.App.Name, Environment: string(cfg.App.Environment), Version: version,
+	})
+	if err != nil {
+		return fmt.Errorf("build logger: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	db, err := database.New(ctx, database.Config{
+		DSN:              cfg.Database.DSN.Reveal(),
+		MaxConns:         4,
+		MinConns:         1,
+		ConnectTimeout:   cfg.Database.ConnectTimeout,
+		StatementTimeout: cfg.Database.StatementTimeout,
+		ApplicationName:  cfg.App.Name + "-retention",
+	}, log)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer db.Close()
+
+	w := worker.NewRetentionWorker(
+		postgres.NewWebhookRepo(db.Pool(), cfg.Sweeper.StaleClaimAfter),
+		retentionConfig(cfg), log)
+
+	result := w.RunOnce(ctx)
+	stats, err := w.Stats(ctx)
+	if err != nil {
+		return fmt.Errorf("read retention stats: %w", err)
+	}
+
+	fmt.Printf("purged %d payload(s): %d settled, %d unresolved\n",
+		result.Total(), result.Settled, result.Unsettled)
+	fmt.Printf("still holding full payloads  %d\n", stats.WithPayload)
+	fmt.Printf("already minimised            %d\n", stats.Purged)
+	fmt.Printf("past window, not yet purged  %d\n", stats.DueNow)
+	if stats.OldestPayload != nil {
+		fmt.Printf("oldest full payload          %s (%s ago)\n",
+			stats.OldestPayload.Format(time.RFC3339),
+			time.Since(*stats.OldestPayload).Truncate(time.Second))
+	}
+	// Non-zero exit when data is being kept past its window, so a cron entry
+	// or a compliance check can act without parsing the output.
+	if stats.DueNow > 0 {
+		os.Exit(2)
+	}
+	return nil
 }
 
 // runWebhookTool backs -webhook-report and -webhook-sweep.
