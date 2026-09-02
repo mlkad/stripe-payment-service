@@ -112,5 +112,6 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 3** — domain models, repositories, integration tests
 - [x] **Step 4** — Stripe adapter, Checkout, webhook signature + processing
 - [x] **Step 5** — chi router, middleware (request id, logging, recovery, timeout)
-- [ ] **Step 6** — authentication, Customer Portal, entitlement API
-- [ ] **Step 7** — CI, observability, deployment
+- [x] **Step 6** — React dashboard, Stripe Elements, entitlement read API
+- [ ] **Step 7** — authentication, Customer Portal, dunning
+- [ ] **Step 8** — CI, observability, deployment

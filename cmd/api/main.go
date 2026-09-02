@@ -23,6 +23,7 @@ import (
 	"github.com/mlkad/stripe-payment-service/internal/config"
 	"github.com/mlkad/stripe-payment-service/internal/database"
 	"github.com/mlkad/stripe-payment-service/internal/handler"
+	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	"github.com/mlkad/stripe-payment-service/internal/logger"
 	"github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
@@ -135,20 +136,25 @@ func run() error {
 	checkoutService, err := service.NewCheckoutService(userRepo, stripeClient, service.CheckoutConfig{
 		SuccessURL:      cfg.Stripe.CheckoutSuccessURL,
 		CancelURL:       cfg.Stripe.CheckoutCancelURL,
+		ReturnURL:       cfg.Stripe.CheckoutReturnURL,
 		AllowedPriceIDs: cfg.Stripe.AllowedPriceIDs,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("build checkout service: %w", err)
 	}
 
+	subscriptionService := service.NewSubscriptionService(subRepo, log)
+
 	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
+	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, log)
 	healthHandler := handler.NewHealthHandler(db, log, version)
 
 	srv := &http.Server{
 		Addr: cfg.HTTP.Addr(),
-		Handler: handler.NewRouter(stripeHandler, healthHandler, handler.RouterConfig{
+		Handler: handler.NewRouter(stripeHandler, subscriptionHandler, healthHandler, handler.RouterConfig{
 			APITimeout:     cfg.HTTP.APITimeout,
 			WebhookTimeout: cfg.HTTP.WebhookTimeout,
+			CORS:           middleware.CORSConfig{AllowedOrigins: cfg.HTTP.CORSAllowedOrigins},
 		}, log),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
