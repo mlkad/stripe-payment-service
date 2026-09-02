@@ -172,8 +172,30 @@ func (c *Client) VerifyWebhook(payload []byte, signatureHeader string) (stripesd
 
 // --- checkout ----------------------------------------------------------------
 
+// UIMode selects how the checkout is presented.
+//
+// Hosted redirects the browser to Stripe's own page; Embedded returns a client
+// secret the frontend mounts inside the app with Stripe Elements. Embedded
+// requires a ReturnURL and forbids SuccessURL/CancelURL - Stripe rejects the
+// call if they are mixed.
+type UIMode string
+
+const (
+	UIModeHosted   UIMode = "hosted"
+	UIModeEmbedded UIMode = "embedded"
+)
+
+func (m UIMode) valid() bool { return m == UIModeHosted || m == UIModeEmbedded || m == "" }
+
 // CheckoutSessionInput describes a subscription checkout to open.
 type CheckoutSessionInput struct {
+	// UIMode defaults to UIModeHosted when empty.
+	UIMode UIMode
+
+	// ReturnURL is where Stripe sends the browser after an embedded checkout
+	// completes. Required for UIModeEmbedded, ignored otherwise.
+	ReturnURL string
+
 	PriceID  string
 	Quantity int64
 
@@ -215,14 +237,22 @@ func (in CheckoutSessionInput) validate() error {
 	if in.CustomerID != "" && in.CustomerEmail != "" {
 		problems = append(problems, "customer_id and customer_email are mutually exclusive")
 	}
-	if in.SuccessURL == "" {
-		problems = append(problems, "success_url is required")
-	}
-	if in.CancelURL == "" {
-		problems = append(problems, "cancel_url is required")
+	if in.UIMode != UIModeEmbedded {
+		if in.SuccessURL == "" {
+			problems = append(problems, "success_url is required")
+		}
+		if in.CancelURL == "" {
+			problems = append(problems, "cancel_url is required")
+		}
 	}
 	if in.TrialPeriodDays < 0 {
 		problems = append(problems, "trial_period_days must not be negative")
+	}
+	if !in.UIMode.valid() {
+		problems = append(problems, "ui_mode must be hosted or embedded")
+	}
+	if in.UIMode == UIModeEmbedded && in.ReturnURL == "" {
+		problems = append(problems, "return_url is required for embedded checkout")
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s", ErrInvalidRequest, strings.Join(problems, "; "))
@@ -233,9 +263,14 @@ func (in CheckoutSessionInput) validate() error {
 // CheckoutSession is the subset of the created session the caller needs. The
 // full SDK object is deliberately not exposed.
 type CheckoutSession struct {
-	ID        string
-	URL       string
-	ExpiresAt time.Time
+	ID  string
+	URL string
+
+	// ClientSecret is populated only for embedded checkout. It is a
+	// session-scoped, short-lived token that the frontend needs in order to
+	// mount the form, not an API credential.
+	ClientSecret string
+	ExpiresAt    time.Time
 }
 
 func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionInput) (*CheckoutSession, error) {
@@ -244,9 +279,7 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionIn
 	}
 
 	params := &stripesdk.CheckoutSessionCreateParams{
-		Mode:       stripesdk.String(string(stripesdk.CheckoutSessionModeSubscription)),
-		SuccessURL: stripesdk.String(in.SuccessURL),
-		CancelURL:  stripesdk.String(in.CancelURL),
+		Mode: stripesdk.String(string(stripesdk.CheckoutSessionModeSubscription)),
 		LineItems: []*stripesdk.CheckoutSessionCreateLineItemParams{{
 			Price:    stripesdk.String(in.PriceID),
 			Quantity: stripesdk.Int64(in.Quantity),
@@ -257,6 +290,17 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionIn
 		Metadata: in.Metadata,
 	}
 	params.Context = ctx
+
+	// Stripe rejects a session that carries both a return_url and the
+	// success/cancel pair, so the two presentations are mutually exclusive here
+	// rather than merely different.
+	if in.UIMode == UIModeEmbedded {
+		params.UIMode = stripesdk.String(string(stripesdk.CheckoutSessionUIModeEmbeddedPage))
+		params.ReturnURL = stripesdk.String(in.ReturnURL)
+	} else {
+		params.SuccessURL = stripesdk.String(in.SuccessURL)
+		params.CancelURL = stripesdk.String(in.CancelURL)
+	}
 
 	if in.ClientReferenceID != "" {
 		params.ClientReferenceID = stripesdk.String(in.ClientReferenceID)
@@ -279,7 +323,7 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionIn
 		return nil, classify("create checkout session", err)
 	}
 
-	out := &CheckoutSession{ID: session.ID, URL: session.URL}
+	out := &CheckoutSession{ID: session.ID, URL: session.URL, ClientSecret: session.ClientSecret}
 	if session.ExpiresAt > 0 {
 		out.ExpiresAt = time.Unix(session.ExpiresAt, 0).UTC()
 	}

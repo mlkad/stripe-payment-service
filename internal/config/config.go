@@ -98,6 +98,11 @@ type HTTP struct {
 	// the 503 the middleware wants to send.
 	APITimeout     time.Duration
 	WebhookTimeout time.Duration
+
+	// CORSAllowedOrigins lists the browser origins permitted to call the API,
+	// matched exactly. Empty disables cross-origin access entirely, which is the
+	// right default for a deployment fronted by the same domain as its UI.
+	CORSAllowedOrigins []string
 }
 
 // Addr renders the listen address for net/http.
@@ -133,6 +138,10 @@ type Stripe struct {
 
 	CheckoutSuccessURL string
 	CheckoutCancelURL  string
+
+	// CheckoutReturnURL is where Stripe sends the browser after an embedded
+	// checkout completes. Only needed when the frontend uses Stripe Elements.
+	CheckoutReturnURL string
 
 	// AllowedPriceIDs restricts what a checkout request may ask for. Empty means
 	// unrestricted, which Validate refuses in production: the price id arrives
@@ -195,6 +204,8 @@ func Load() (*Config, error) {
 			IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 			APITimeout:        l.duration("HTTP_API_TIMEOUT", 10*time.Second),
 			WebhookTimeout:    l.duration("HTTP_WEBHOOK_TIMEOUT", 25*time.Second),
+
+			CORSAllowedOrigins: l.csv("CORS_ALLOWED_ORIGINS"),
 		},
 		Database: Database{
 			DSN:                Secret(l.required("DATABASE_URL")),
@@ -221,6 +232,7 @@ func Load() (*Config, error) {
 
 			CheckoutSuccessURL: l.str("STRIPE_CHECKOUT_SUCCESS_URL", "http://localhost:3000/billing/success?session_id={CHECKOUT_SESSION_ID}"),
 			CheckoutCancelURL:  l.str("STRIPE_CHECKOUT_CANCEL_URL", "http://localhost:3000/billing/cancel"),
+			CheckoutReturnURL:  l.str("STRIPE_CHECKOUT_RETURN_URL", "http://localhost:5173/billing/return?session_id={CHECKOUT_SESSION_ID}"),
 			AllowedPriceIDs:    l.csv("STRIPE_ALLOWED_PRICE_IDS"),
 		},
 		Log: Log{
@@ -373,6 +385,33 @@ func (c *Config) validateStripe() []error {
 			// The session id is appended to the success URL; over plain HTTP it
 			// is readable by anything on the path.
 			add("%s must use https in production (got scheme %q)", name, u.Scheme)
+		}
+	}
+
+	for _, origin := range c.HTTP.CORSAllowedOrigins {
+		u, err := url.Parse(origin)
+		switch {
+		case origin == "*":
+			// A wildcard cannot be combined with credentialed requests, and this
+			// API is called with them. Reflecting any origin would let any site
+			// read a logged-in user's billing data.
+			add("CORS_ALLOWED_ORIGINS must not contain '*'; list origins explicitly")
+		case err != nil || !u.IsAbs() || u.Host == "":
+			add("CORS_ALLOWED_ORIGINS entry %q must be an absolute origin like https://app.example.com", origin)
+		case u.Path != "" && u.Path != "/":
+			add("CORS_ALLOWED_ORIGINS entry %q must be scheme://host[:port] with no path", origin)
+		case c.App.Environment.IsProduction() && u.Scheme != "https":
+			add("CORS_ALLOWED_ORIGINS entry %q must use https in production", origin)
+		}
+	}
+
+	if raw := c.Stripe.CheckoutReturnURL; raw != "" {
+		u, err := url.Parse(raw)
+		switch {
+		case err != nil || !u.IsAbs():
+			add("STRIPE_CHECKOUT_RETURN_URL must be an absolute URL (got %q)", raw)
+		case c.App.Environment.IsProduction() && u.Scheme != "https":
+			add("STRIPE_CHECKOUT_RETURN_URL must use https in production")
 		}
 	}
 

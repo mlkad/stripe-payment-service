@@ -124,11 +124,17 @@ type checkoutRequest struct {
 	PriceID         string `json:"price_id"`
 	Quantity        int64  `json:"quantity,omitempty"`
 	TrialPeriodDays int64  `json:"trial_period_days,omitempty"`
+
+	// UIMode is "hosted" (default) or "embedded".
+	UIMode string `json:"ui_mode,omitempty"`
 }
 
 type checkoutResponse struct {
 	SessionID string `json:"session_id"`
-	URL       string `json:"url"`
+
+	// Exactly one of these is populated, matching the requested ui_mode.
+	URL          string `json:"url,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
 }
 
 func (h *StripeHandler) HandleCheckout(w http.ResponseWriter, r *http.Request) {
@@ -147,18 +153,29 @@ func (h *StripeHandler) HandleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode := strings.TrimSpace(req.UIMode)
+	if mode != "" && mode != "hosted" && mode != "embedded" {
+		writeError(w, http.StatusBadRequest, `ui_mode must be "hosted" or "embedded"`)
+		return
+	}
+
 	result, err := h.checkout.CreateCheckoutSession(ctx, service.CheckoutRequest{
 		UserID:          userID,
 		PriceID:         strings.TrimSpace(req.PriceID),
 		Quantity:        req.Quantity,
 		TrialPeriodDays: req.TrialPeriodDays,
+		Embedded:        mode == "embedded",
 	})
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, checkoutResponse{SessionID: result.SessionID, URL: result.URL})
+	writeJSON(w, http.StatusCreated, checkoutResponse{
+		SessionID:    result.SessionID,
+		URL:          result.URL,
+		ClientSecret: result.ClientSecret,
+	})
 }
 
 // writeServiceError maps a use case failure onto a status code without leaking

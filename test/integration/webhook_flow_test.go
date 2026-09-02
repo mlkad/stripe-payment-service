@@ -21,6 +21,7 @@ import (
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
 	"github.com/mlkad/stripe-payment-service/internal/handler"
+	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
@@ -73,8 +74,11 @@ func newWebhookStack(t *testing.T) (*service.WebhookService, http.Handler) {
 	// deadline - rather than the handler in isolation.
 	router := handler.NewRouter(
 		handler.NewStripeHandler(svc, checkout, log),
+		handler.NewSubscriptionHandler(service.NewSubscriptionService(repo.NewSubscriptionRepo(pool), log), log),
 		handler.NewHealthHandler(stubProbe{}, log, "test"),
-		handler.RouterConfig{},
+		handler.RouterConfig{
+			CORS: middleware.CORSConfig{AllowedOrigins: []string{"http://localhost:5173"}},
+		},
 		log,
 	)
 	return svc, router
