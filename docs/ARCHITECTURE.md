@@ -284,6 +284,77 @@ the `jti` claim, which is already minted for that purpose.
   guessing slow, but it makes the endpoint a cheap way to burn server CPU.
 - No password reset, email verification, or account lockout.
 
+## Dunning and the second event cursor
+
+`invoice.payment_failed` is where a renewal starts going wrong and the window in
+which a customer can still be saved. `invoice.payment_succeeded` closes it.
+Migration 00004 adds the state those two maintain: `payment_failed_at` (the
+flag), `payment_failure_count`, `last_payment_error`, `next_payment_attempt_at`.
+
+**Neither handler writes `status`.** Stripe decides what a failed payment means
+for the subscription — `past_due` when it was active, `incomplete` on a first
+invoice, `canceled` once retries run out — and reports it in a separate
+`customer.subscription.updated`. Deriving status from the invoice would race
+that event and sometimes contradict it.
+
+### Why invoice events need their own cursor
+
+`subscriptions.last_stripe_event_at` guards the `customer.subscription.*`
+stream. Invoice events must not share it. They are a different Stripe object
+with its own event stream, and the two interleave freely: an
+`invoice.payment_failed` created at T+5 would advance a shared cursor past a
+`customer.subscription.updated` created at T+4, and that subscription event —
+the one carrying the authoritative status — would be rejected as stale and
+silently dropped.
+
+Migration 00004 therefore adds `last_invoice_event_at` as a second, independent
+cursor. `TestInvoice_DoesNotStarveTheSubscriptionEventStream` is the negative
+control: pointing the invoice path at the shared cursor makes the status stay
+`active` when it should be `past_due`.
+
+Idempotency needs nothing new. The event ledger already makes a redelivery a
+no-op, which is what keeps `payment_failure_count` from double-counting.
+
+## Rate limiting
+
+Applied to `POST /api/v1/auth/login` and `/register` only. Those are the only
+routes where an anonymous caller can make the server do expensive work — one
+bcrypt comparison at cost 12 is ~250ms of CPU — and the only ones where
+unlimited attempts mean unlimited password guesses.
+
+The webhook route is deliberately **not** limited. A 429 tells Stripe to
+redeliver, so throttling it builds a retry backlog rather than shedding load.
+
+Three details that are easy to get wrong:
+
+**A rejected request must not consume a token.** `rate.Limiter.ReserveN` takes
+one whether or not the caller proceeds, so a denial has to cancel its
+reservation. Without the cancel, every blocked attempt pushes the client's
+recovery further out and sustained hammering becomes an indefinite lockout —
+measured at 195ms of deferred recovery after twenty denials that should have
+cost nothing.
+
+**IPv6 is limited per /64, not per address.** A single customer allocation is a
+/64 or larger, so limiting per address lets one attacker cycle through billions
+of them — defeating the limit and filling the bucket map at the same time.
+
+**`X-Forwarded-For` is only read when `TRUSTED_PROXIES` says how many hops to
+skip.** The header is appended to by each hop, so with N trusted proxies the
+client is the Nth entry from the right; everything further left is
+caller-supplied. Reading the leftmost entry — the common shortcut — lets an
+attacker send a fresh header per request and get an unlimited allowance. The
+default is 0, meaning `RemoteAddr` only.
+
+The bucket map is bounded and self-pruning; at capacity it resets wholesale
+rather than evicting a victim, because a targeted eviction would let an attacker
+who can spray addresses clear a specific client's limit on demand.
+
+The limiter is in-memory and therefore per-instance: behind N replicas the
+effective limit is N times the configured one. That is the right trade at this
+scale — a shared counter adds a network round trip and a new failure mode to the
+login path — but it is a ceiling, not a floor, and a horizontally scaled
+deployment should move the state out.
+
 ## Query contracts the repository layer must honour
 
 Partial indices are the reason the hot paths stay fast at scale, but two of them

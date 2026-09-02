@@ -213,6 +213,20 @@ type Subscription struct {
 	LatestInvoiceID        *string `json:"latest_invoice_id,omitempty"`
 	DefaultPaymentMethodID *string `json:"default_payment_method_id,omitempty"`
 
+	// Dunning state, maintained by the invoice.* handlers. PaymentFailedAt is
+	// the flag: nil means no outstanding failure.
+	PaymentFailedAt      *time.Time `json:"payment_failed_at,omitempty"`
+	PaymentFailureCount  int32      `json:"payment_failure_count"`
+	LastPaymentError     *string    `json:"last_payment_error,omitempty"`
+	NextPaymentAttemptAt *time.Time `json:"next_payment_attempt_at,omitempty"`
+
+	// LastInvoiceEventID and LastInvoiceEventAt are the invoice stream's own
+	// ordering cursor, deliberately separate from LastStripeEventAt. The two
+	// streams interleave, and sharing one cursor would let an invoice event
+	// reject the customer.subscription.* event that carries the real status.
+	LastInvoiceEventID *string    `json:"-"`
+	LastInvoiceEventAt *time.Time `json:"-"`
+
 	// LastStripeEventID and LastStripeEventAt record the newest event applied to
 	// this row. See UpdateSubscriptionStatus for how they gate out-of-order
 	// delivery.
@@ -264,11 +278,26 @@ func (s *Subscription) Validate() error {
 	if s.Status == SubscriptionCanceled && s.CanceledAt == nil {
 		v.add("canceled_at", "is required when status is canceled")
 	}
+	// Mirrors subscriptions_dunning_consistency_chk: the flag and the counter
+	// must agree, or a handler updated one and forgot the other.
+	if s.PaymentFailureCount < 0 {
+		v.add("payment_failure_count", "must not be negative")
+	}
+	if (s.PaymentFailedAt == nil) != (s.PaymentFailureCount == 0) {
+		v.add("payment_failed_at", "must be set exactly when payment_failure_count is greater than zero")
+	}
 	return v.result()
 }
 
 // IsLive reports whether this subscription currently grants access.
 func (s *Subscription) IsLive() bool { return s.Status.IsLive() }
+
+// InDunning reports whether a payment has failed and not yet been recovered.
+//
+// Independent of IsLive: a past_due subscription is both live and in dunning,
+// which is the whole point - access continues while Stripe retries, and the
+// customer is told rather than locked out.
+func (s *Subscription) InDunning() bool { return s.PaymentFailedAt != nil }
 
 // ProcessedWebhook is one row of the idempotency ledger.
 type ProcessedWebhook struct {

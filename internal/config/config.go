@@ -122,6 +122,17 @@ type HTTP struct {
 	// matched exactly. Empty disables cross-origin access entirely, which is the
 	// right default for a deployment fronted by the same domain as its UI.
 	CORSAllowedOrigins []string
+
+	// TrustedProxies is the number of reverse proxies in front of this service.
+	// It must be exact: the rate limiter counts that many hops from the right
+	// of X-Forwarded-For to find the client, and everything further left is
+	// caller-supplied. Too high and an attacker picks their own bucket; too low
+	// and every client behind the proxy shares one.
+	TrustedProxies int
+
+	// AuthRateLimit throttles the credential endpoints.
+	AuthRateLimitRPS   float64
+	AuthRateLimitBurst int
 }
 
 // Addr renders the listen address for net/http.
@@ -228,6 +239,9 @@ func Load() (*Config, error) {
 			WebhookTimeout:    l.duration("HTTP_WEBHOOK_TIMEOUT", 25*time.Second),
 
 			CORSAllowedOrigins: l.csv("CORS_ALLOWED_ORIGINS"),
+			TrustedProxies:     l.intVal("TRUSTED_PROXIES", 0),
+			AuthRateLimitRPS:   l.float("AUTH_RATE_LIMIT_RPS", 0.2),
+			AuthRateLimitBurst: l.intVal("AUTH_RATE_LIMIT_BURST", 5),
 		},
 		Database: Database{
 			DSN:                Secret(l.required("DATABASE_URL")),
@@ -299,6 +313,16 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.ReadHeaderTimeout <= 0 {
 		add("HTTP_READ_HEADER_TIMEOUT must be positive - a zero value invites Slowloris")
+	}
+
+	if c.HTTP.TrustedProxies < 0 {
+		add("TRUSTED_PROXIES must not be negative (got %d)", c.HTTP.TrustedProxies)
+	}
+	if c.HTTP.AuthRateLimitRPS <= 0 {
+		add("AUTH_RATE_LIMIT_RPS must be positive")
+	}
+	if c.HTTP.AuthRateLimitBurst < 1 {
+		add("AUTH_RATE_LIMIT_BURST must be at least 1 (got %d)", c.HTTP.AuthRateLimitBurst)
 	}
 
 	// A request deadline that outlives WriteTimeout can never fire: the server
@@ -589,6 +613,19 @@ func (l *loader) boolVal(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func (l *loader) float(key string, def float64) float64 {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		l.fail("%s must be a number (got %q)", key, v)
+		return def
+	}
+	return f
 }
 
 // csv reads a comma-separated list, discarding blank entries so a trailing

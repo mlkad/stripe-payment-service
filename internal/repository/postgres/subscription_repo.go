@@ -16,6 +16,34 @@ type SubscriptionRepository interface {
 	GetSubscriptionByStripeID(ctx context.Context, stripeSubscriptionID string) (*domain.Subscription, error)
 	GetLatestSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (*domain.Subscription, error)
 	UpdateSubscriptionStatus(ctx context.Context, in SubscriptionStatusUpdate) (*domain.Subscription, error)
+	RecordInvoicePayment(ctx context.Context, in InvoicePaymentUpdate) (*domain.Subscription, error)
+}
+
+// InvoicePaymentUpdate carries one invoice.payment_succeeded or
+// invoice.payment_failed event.
+type InvoicePaymentUpdate struct {
+	StripeSubscriptionID string
+
+	// Succeeded selects which side of the dunning state is written: a success
+	// clears the flag and the counter, a failure sets them.
+	Succeeded bool
+
+	// EventID and EventCreatedAt drive the staleness check against
+	// last_invoice_event_at - the invoice stream's own cursor, not the
+	// subscription stream's.
+	EventID        string
+	EventCreatedAt time.Time
+
+	InvoiceID *string
+
+	// FailureReason and NextAttemptAt are only meaningful on a failure.
+	FailureReason *string
+	NextAttemptAt *time.Time
+
+	// CurrentPeriodStart/End arrive on a successful renewal invoice. Nil leaves
+	// the stored period untouched.
+	CurrentPeriodStart *time.Time
+	CurrentPeriodEnd   *time.Time
 }
 
 // SubscriptionStatusUpdate carries one Stripe subscription event.
@@ -61,6 +89,8 @@ const subscriptionColumns = `
 	current_period_start, current_period_end, cancel_at_period_end, cancel_at,
 	canceled_at, ended_at, trial_start, trial_end, latest_invoice_id,
 	default_payment_method_id, last_stripe_event_id, last_stripe_event_at,
+	payment_failed_at, payment_failure_count, last_payment_error,
+	next_payment_attempt_at, last_invoice_event_id, last_invoice_event_at,
 	metadata, created_at, updated_at`
 
 func (r *SubscriptionRepo) CreateSubscription(ctx context.Context, s *domain.Subscription) error {
@@ -201,6 +231,114 @@ func (r *SubscriptionRepo) UpdateSubscriptionStatus(ctx context.Context, in Subs
 	return sub, nil
 }
 
+// RecordInvoicePayment applies one invoice.payment_* event.
+//
+// It guards on last_invoice_event_at, not last_stripe_event_at. The invoice and
+// subscription event streams interleave freely, and a shared cursor would let
+// an invoice event created at T5 reject a customer.subscription.updated created
+// at T4 - discarding the event that carries the authoritative status. Each
+// stream advances only its own cursor.
+//
+// Status is deliberately not written here. Stripe decides what a failed payment
+// means for the subscription (past_due when it was active, incomplete on a
+// first invoice, canceled once retries are exhausted) and says so in a
+// customer.subscription.updated event. Deriving it from the invoice would race
+// that event and sometimes contradict it.
+//
+// The row is locked for the same reason UpdateSubscriptionStatus locks it: the
+// read-decide-write of the staleness check is only atomic while it is held.
+func (r *SubscriptionRepo) RecordInvoicePayment(ctx context.Context, in InvoicePaymentUpdate) (*domain.Subscription, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, mapError("record invoice payment: begin", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var appliedAt *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT last_invoice_event_at FROM subscriptions WHERE stripe_subscription_id = $1 FOR UPDATE`,
+		in.StripeSubscriptionID,
+	).Scan(&appliedAt)
+	if err != nil {
+		return nil, mapError("record invoice payment: lock row", err)
+	}
+
+	// Strictly-older events are rejected, equal timestamps applied - Stripe's
+	// one-second resolution means distinct invoice events routinely collide.
+	if appliedAt != nil && in.EventCreatedAt.Before(*appliedAt) {
+		return nil, domain.ErrStaleEvent
+	}
+
+	// The two branches are written separately rather than through COALESCE
+	// gymnastics: a success must clear the dunning columns outright, and a
+	// failure must increment a counter it also reads.
+	//
+	// Note that last_payment_error and next_payment_attempt_at are assigned,
+	// not COALESCEd, unlike latest_invoice_id. That is deliberate. Each failure
+	// carries its own decline reason, and Stripe nulls next_payment_attempt
+	// once retries are exhausted - so an absent value means "no retry
+	// scheduled", which is information worth keeping rather than a gap to paper
+	// over with the previous attempt's answer. latest_invoice_id is COALESCEd
+	// because an event that does not name an invoice is not saying the
+	// subscription has none.
+	const successQuery = `
+		UPDATE subscriptions SET
+			latest_invoice_id       = COALESCE($2, latest_invoice_id),
+			current_period_start    = COALESCE($3, current_period_start),
+			current_period_end      = COALESCE($4, current_period_end),
+			payment_failed_at       = NULL,
+			payment_failure_count   = 0,
+			last_payment_error      = NULL,
+			next_payment_attempt_at = NULL,
+			last_invoice_event_id   = $5,
+			last_invoice_event_at   = $6
+		WHERE stripe_subscription_id = $1
+		RETURNING ` + subscriptionColumns
+
+	const failureQuery = `
+		UPDATE subscriptions SET
+			latest_invoice_id       = COALESCE($2, latest_invoice_id),
+			payment_failed_at       = $3,
+			payment_failure_count   = subscriptions.payment_failure_count + 1,
+			last_payment_error      = $4,
+			next_payment_attempt_at = $5,
+			last_invoice_event_id   = $6,
+			last_invoice_event_at   = $7
+		WHERE stripe_subscription_id = $1
+		RETURNING ` + subscriptionColumns
+
+	var sub *domain.Subscription
+	if in.Succeeded {
+		sub, err = scanSubscription(tx.QueryRow(ctx, successQuery,
+			in.StripeSubscriptionID, in.InvoiceID,
+			in.CurrentPeriodStart, in.CurrentPeriodEnd,
+			nullIfEmpty(in.EventID), in.EventCreatedAt,
+		))
+	} else {
+		sub, err = scanSubscription(tx.QueryRow(ctx, failureQuery,
+			in.StripeSubscriptionID, in.InvoiceID,
+			in.EventCreatedAt, truncate(derefOr(in.FailureReason, "payment failed")),
+			in.NextAttemptAt,
+			nullIfEmpty(in.EventID), in.EventCreatedAt,
+		))
+	}
+	if err != nil {
+		return nil, mapError("record invoice payment", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, mapError("record invoice payment: commit", err)
+	}
+	return sub, nil
+}
+
+func derefOr(s *string, fallback string) string {
+	if s == nil || *s == "" {
+		return fallback
+	}
+	return *s
+}
+
 func nullIfEmpty(s string) *string {
 	if s == "" {
 		return nil
@@ -233,6 +371,12 @@ func scanSubscription(r row) (*domain.Subscription, error) {
 		&s.DefaultPaymentMethodID,
 		&s.LastStripeEventID,
 		&s.LastStripeEventAt,
+		&s.PaymentFailedAt,
+		&s.PaymentFailureCount,
+		&s.LastPaymentError,
+		&s.NextPaymentAttemptAt,
+		&s.LastInvoiceEventID,
+		&s.LastInvoiceEventAt,
 		&s.Metadata,
 		&s.CreatedAt,
 		&s.UpdatedAt,

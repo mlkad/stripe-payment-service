@@ -161,6 +161,12 @@ func run() error {
 	subscriptionService := service.NewSubscriptionService(subRepo, log)
 	authService := service.NewAuthService(userRepo, hasher, tokens, log)
 
+	authRateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
+		Rate:  cfg.HTTP.AuthRateLimitRPS,
+		Burst: cfg.HTTP.AuthRateLimitBurst,
+	}, log)
+	defer authRateLimiter.Close()
+
 	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
 	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, log)
 	authHandler := handler.NewAuthHandler(authService, log)
@@ -173,6 +179,8 @@ func run() error {
 			WebhookTimeout: cfg.HTTP.WebhookTimeout,
 			CORS:           middleware.CORSConfig{AllowedOrigins: cfg.HTTP.CORSAllowedOrigins},
 			Tokens:         tokens,
+			AuthRateLimit:  authRateLimiter,
+			TrustedProxies: cfg.HTTP.TrustedProxies,
 		}, log),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
