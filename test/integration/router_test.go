@@ -41,10 +41,10 @@ func TestRouter_MountsTheExpectedRoutes(t *testing.T) {
 		{"webhook rejects GET", http.MethodGet, "/webhook", "", http.StatusMethodNotAllowed},
 		{"checkout rejects GET", http.MethodGet, "/api/v1/checkout", "", http.StatusMethodNotAllowed},
 		{"webhook without signature", http.MethodPost, "/webhook", "{}", http.StatusBadRequest},
-		{"checkout with malformed body", http.MethodPost, "/api/v1/checkout", "{", http.StatusBadRequest},
-		{"checkout with unknown field", http.MethodPost, "/api/v1/checkout", `{"nope":1}`, http.StatusBadRequest},
-		{"checkout with bad user id", http.MethodPost, "/api/v1/checkout",
-			`{"user_id":"not-a-uuid","price_id":"price_X"}`, http.StatusBadRequest},
+		{"checkout without a token", http.MethodPost, "/api/v1/checkout", `{"price_id":"price_X"}`, http.StatusUnauthorized},
+		{"subscription without a token", http.MethodGet, "/api/v1/subscription", "", http.StatusUnauthorized},
+		{"register is public", http.MethodPost, "/api/v1/auth/register", `{`, http.StatusBadRequest},
+		{"login is public", http.MethodPost, "/api/v1/auth/login", `{`, http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -4,11 +4,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strings"
-
-	"github.com/google/uuid"
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
+	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 )
 
@@ -21,17 +19,18 @@ func NewSubscriptionHandler(subs *service.SubscriptionService, log *slog.Logger)
 	return &SubscriptionHandler{subs: subs, log: log}
 }
 
-// HandleGetSubscription answers the dashboard's "what am I paying for" query.
+// HandleGetSubscription answers the dashboard's "what am I paying for" query
+// for the authenticated caller.
 //
-// user_id arrives as a query parameter only because authentication is not yet
-// wired; it must come from the session once it is. As written, any caller can
-// read any user's billing state.
+// There is no user_id parameter. The subject comes from the verified token, so
+// no request field points at anyone else's billing state; a stale client still
+// sending ?user_id= has it ignored rather than honoured.
 func (h *SubscriptionHandler) HandleGetSubscription(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	userID, err := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("user_id")))
+	userID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "user_id must be a UUID")
+		writeUnwiredRoute(w, h.log, ctx, err)
 		return
 	}
 
