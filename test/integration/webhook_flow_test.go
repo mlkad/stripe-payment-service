@@ -72,12 +72,17 @@ func newWebhookStack(t *testing.T) (*service.WebhookService, http.Handler) {
 	// The full router, not a bare mux: these tests then exercise the real
 	// middleware chain - correlation, access logging, recovery and the per-route
 	// deadline - rather than the handler in isolation.
+	userRepo := repo.NewUserRepo(pool)
+	authService := service.NewAuthService(userRepo, testHasher(t), testTokens(t), log)
+
 	router := handler.NewRouter(
 		handler.NewStripeHandler(svc, checkout, log),
 		handler.NewSubscriptionHandler(service.NewSubscriptionService(repo.NewSubscriptionRepo(pool), log), log),
+		handler.NewAuthHandler(authService, log),
 		handler.NewHealthHandler(stubProbe{}, log, "test"),
 		handler.RouterConfig{
-			CORS: middleware.CORSConfig{AllowedOrigins: []string{"http://localhost:5173"}},
+			CORS:   middleware.CORSConfig{AllowedOrigins: []string{"http://localhost:5173"}},
+			Tokens: testTokens(t),
 		},
 		log,
 	)
