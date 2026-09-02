@@ -117,5 +117,6 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 8** — auth rate limiting, invoice events, dunning state
 - [x] **Step 9** — Customer Portal, CI pipeline
 - [x] **Step 10** — webhook sweeper: dead-letter recovery and alerting
-- [ ] **Step 11** — payload retention, refresh tokens, unit test coverage
-- [ ] **Step 12** — observability, deployment
+- [x] **Step 11** — payload retention and PII minimisation
+- [ ] **Step 12** — refresh tokens, unit test coverage
+- [ ] **Step 13** — observability, deployment
