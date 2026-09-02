@@ -22,6 +22,13 @@ type RouterConfig struct {
 	// Tokens verifies bearer credentials on protected routes.
 	Tokens middleware.TokenParser
 
+	// AuthRateLimit throttles the credential endpoints. Nil disables it.
+	AuthRateLimit *middleware.RateLimiter
+
+	// TrustedProxies is how many reverse proxy hops to skip when identifying
+	// the client. See middleware.ClientKeyFunc.
+	TrustedProxies int
+
 	// WebhookTimeout bounds webhook processing, and is deliberately the longer
 	// of the two: checkout.session.completed makes an outbound call to Stripe
 	// before it writes anything, so it inherits that client's timeout plus the
@@ -105,9 +112,22 @@ func NewRouter(
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Timeout(cfg.APITimeout, log))
 
-		// Public: obtaining a credential cannot itself require one.
-		r.Post("/auth/register", authHandler.HandleRegister)
-		r.Post("/auth/login", authHandler.HandleLogin)
+		// Public: obtaining a credential cannot itself require one. Which is
+		// exactly why these two are rate limited - they are the only routes an
+		// anonymous caller can make do expensive work (a bcrypt comparison per
+		// request), and the only ones where unlimited attempts mean unlimited
+		// password guesses.
+		//
+		// The webhook route is deliberately not limited: a 429 tells Stripe to
+		// redeliver, so throttling it builds a retry backlog instead of
+		// shedding load.
+		r.Group(func(r chi.Router) {
+			if cfg.AuthRateLimit != nil {
+				r.Use(cfg.AuthRateLimit.Middleware(middleware.ClientKeyFunc(cfg.TrustedProxies)))
+			}
+			r.Post("/auth/register", authHandler.HandleRegister)
+			r.Post("/auth/login", authHandler.HandleLogin)
+		})
 
 		// Everything below requires a valid bearer token. The subject is read
 		// from the token inside the handlers; no route here accepts a user id
