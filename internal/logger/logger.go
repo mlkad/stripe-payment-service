@@ -174,6 +174,17 @@ func (h *contextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &contextHandler{Handler: h.Handler.WithAttrs(attrs)}
 }
 
+// WithGroup keeps the context enrichment alive across grouping, but the
+// injected request_id lands *inside* the group rather than at the top level.
+//
+// That is a limitation of the handler model rather than an oversight: Handle
+// receives a record and can only add attributes through the handler it holds,
+// which by then is already grouped. Escaping the group would mean emitting a
+// second record.
+//
+// The id is still present and still queryable, just as "<group>.request_id".
+// Prefer With over WithGroup on a request-scoped logger if a flat field
+// matters to your log aggregator.
 func (h *contextHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
