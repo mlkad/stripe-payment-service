@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
@@ -13,6 +14,7 @@ import (
 type SubscriptionRepository interface {
 	CreateSubscription(ctx context.Context, s *domain.Subscription) error
 	GetSubscriptionByStripeID(ctx context.Context, stripeSubscriptionID string) (*domain.Subscription, error)
+	GetLatestSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (*domain.Subscription, error)
 	UpdateSubscriptionStatus(ctx context.Context, in SubscriptionStatusUpdate) (*domain.Subscription, error)
 }
 
@@ -100,6 +102,27 @@ func (r *SubscriptionRepo) GetSubscriptionByStripeID(ctx context.Context, stripe
 	s, err := scanSubscription(r.pool.QueryRow(ctx, query, stripeSubscriptionID))
 	if err != nil {
 		return nil, mapError("get subscription by stripe id", err)
+	}
+	return s, nil
+}
+
+// GetLatestSubscriptionByUserID returns the user's most recent subscription
+// whatever its status, so a dashboard can render "canceled" rather than an
+// empty state. The ORDER BY matches idx_subscriptions_user_id_created_at.
+//
+// Deliberately not filtered to live statuses: that would use the smaller
+// partial index but make a lapsed subscriber indistinguishable from someone who
+// never subscribed, and those need different messaging.
+func (r *SubscriptionRepo) GetLatestSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (*domain.Subscription, error) {
+	const query = `SELECT ` + subscriptionColumns + `
+		FROM subscriptions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1`
+
+	s, err := scanSubscription(r.pool.QueryRow(ctx, query, userID))
+	if err != nil {
+		return nil, mapError("get latest subscription by user id", err)
 	}
 	return s, nil
 }

@@ -78,6 +78,13 @@ stripe-payment-service/
 │   ├── logger/                     # slog setup, request-id correlation, redaction
 │   └── database/                   # pgxpool construction, health, query tracing
 │
+├── web/                            # ── React 19 + Vite 8 + Tailwind 4 UI ──
+│   └── src/
+│       ├── api/                    #    typed client; mirrors the Go read models
+│       ├── components/             #    PricingTable, CheckoutModal, Dashboard
+│       ├── hooks/                  #    useSubscription: load + poll after checkout
+│       └── lib/                    #    stripe.js loader, formatting
+│
 ├── migrations/                     # Goose SQL migrations (source of truth for schema)
 ├── pkg/                            # genuinely reusable, import-safe by third parties
 │   └── money/
