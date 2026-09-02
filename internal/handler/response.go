@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -27,6 +29,19 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
+}
+
+// writeUnwiredRoute answers a handler that asked for the caller's identity on a
+// route the auth middleware never wrapped.
+//
+// 500, emphatically not 401. A 401 here would be indistinguishable from a
+// genuine missing token, so an endpoint accidentally mounted outside RequireAuth
+// would look protected while enforcing nothing - the exact failure this whole
+// step exists to remove. It is a server wiring bug and is reported as one.
+func writeUnwiredRoute(w http.ResponseWriter, log *slog.Logger, ctx context.Context, cause error) {
+	log.ErrorContext(ctx, "route is missing the auth middleware; refusing to serve it",
+		slog.String("error", cause.Error()))
+	writeError(w, http.StatusInternalServerError, "internal server error")
 }
 
 // decodeJSON reads a size-limited body into dst and turns every failure mode

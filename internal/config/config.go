@@ -75,7 +75,26 @@ type Config struct {
 	HTTP     HTTP
 	Database Database
 	Stripe   Stripe
+	Auth     Auth
 	Log      Log
+}
+
+type Auth struct {
+	// JWTSecret signs and verifies access tokens. Secret: anyone holding it can
+	// mint a token for any user id.
+	JWTSecret Secret
+
+	// JWTIssuer and JWTAudience are verified on every parse, so a token minted
+	// for staging cannot be replayed against production.
+	JWTIssuer   string
+	JWTAudience string
+
+	// AccessTokenTTL bounds the damage from a stolen token. Tokens are stateless
+	// and cannot be revoked before they expire, which is the reason to keep this
+	// short rather than a reason to be relaxed about it.
+	AccessTokenTTL time.Duration
+
+	BcryptCost int
 }
 
 type App struct {
@@ -167,6 +186,9 @@ func (c Config) LogValue() slog.Value {
 		slog.String("db_statement_timeout", c.Database.StatementTimeout.String()),
 		slog.String("stripe_api_version", c.Stripe.APIVersion),
 		slog.String("stripe_key_mode", stripeKeyMode(c.Stripe.SecretKey)),
+		slog.String("jwt_issuer", c.Auth.JWTIssuer),
+		slog.String("jwt_ttl", c.Auth.AccessTokenTTL.String()),
+		slog.Int("bcrypt_cost", c.Auth.BcryptCost),
 		slog.String("log_level", c.Log.Level),
 		slog.String("log_format", c.Log.Format),
 		slog.String("shutdown_timeout", c.App.ShutdownTimeout.String()),
@@ -234,6 +256,13 @@ func Load() (*Config, error) {
 			CheckoutCancelURL:  l.str("STRIPE_CHECKOUT_CANCEL_URL", "http://localhost:3000/billing/cancel"),
 			CheckoutReturnURL:  l.str("STRIPE_CHECKOUT_RETURN_URL", "http://localhost:5173/billing/return?session_id={CHECKOUT_SESSION_ID}"),
 			AllowedPriceIDs:    l.csv("STRIPE_ALLOWED_PRICE_IDS"),
+		},
+		Auth: Auth{
+			JWTSecret:      Secret(l.required("JWT_SECRET")),
+			JWTIssuer:      l.str("JWT_ISSUER", "stripe-payment-service"),
+			JWTAudience:    l.str("JWT_AUDIENCE", "stripe-payment-service-api"),
+			AccessTokenTTL: l.duration("JWT_ACCESS_TOKEN_TTL", time.Hour),
+			BcryptCost:     l.intVal("BCRYPT_COST", 12),
 		},
 		Log: Log{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
@@ -316,6 +345,7 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, c.validateStripe()...)
+	errs = append(errs, c.validateAuth()...)
 
 	if _, err := parseLevelName(c.Log.Level); err != nil {
 		add("LOG_LEVEL must be one of debug, info, warn, error (got %q)", c.Log.Level)
@@ -430,6 +460,47 @@ func (c *Config) validateStripe() []error {
 	if c.App.Environment.IsProduction() && c.Stripe.IgnoreAPIVersionMismatch {
 		add("STRIPE_IGNORE_API_VERSION_MISMATCH must not be enabled in production - " +
 			"events would be deserialised against a version they were not rendered for")
+	}
+	return errs
+}
+
+// validateAuth checks the signing key and the token lifetime.
+func (c *Config) validateAuth() []error {
+	var errs []error
+	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+
+	// An absent secret is already reported as a missing required variable.
+	if secret := c.Auth.JWTSecret.Reveal(); secret != "" {
+		if len(secret) < 32 {
+			add("JWT_SECRET must be at least 32 bytes (got %d) - a shorter HMAC key "+
+				"adds nothing over a 256-bit one and is usually a guessable passphrase", len(secret))
+		}
+		// The value shipped in .env.example, so it is public. Anyone holding it
+		// can mint a token for any user id.
+		if strings.Contains(secret, "change_me") || strings.Contains(secret, "example") {
+			add("JWT_SECRET still holds a placeholder value - generate one with `openssl rand -base64 48`")
+		}
+	}
+
+	if c.Auth.JWTIssuer == "" {
+		add("JWT_ISSUER must not be empty")
+	}
+	if c.Auth.JWTAudience == "" {
+		add("JWT_AUDIENCE must not be empty")
+	}
+
+	switch ttl := c.Auth.AccessTokenTTL; {
+	case ttl <= 0:
+		add("JWT_ACCESS_TOKEN_TTL must be positive")
+	case c.App.Environment.IsProduction() && ttl > 24*time.Hour:
+		// Tokens are stateless: there is no way to revoke one early, so the TTL
+		// is the entire containment window for a stolen credential.
+		add("JWT_ACCESS_TOKEN_TTL is %s; tokens cannot be revoked before expiry, "+
+			"so production must not exceed 24h", ttl)
+	}
+
+	if cost := c.Auth.BcryptCost; cost < 10 || cost > 31 {
+		add("BCRYPT_COST must be between 10 and 31 (got %d)", cost)
 	}
 	return errs
 }
