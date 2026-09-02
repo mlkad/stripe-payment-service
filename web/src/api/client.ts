@@ -3,6 +3,7 @@ import type {
   CheckoutRequest,
   CheckoutSession,
   LoginRequest,
+  PortalSession,
   RegisterRequest,
   Subscription,
   User,
@@ -145,6 +146,14 @@ export const api = {
     return request<CheckoutSession>("/api/v1/checkout", {
       method: "POST",
       body,
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /** Opens Stripe's hosted billing portal for the authenticated user. */
+  createPortalSession(signal?: AbortSignal): Promise<PortalSession> {
+    return request<PortalSession>("/api/v1/portal", {
+      method: "POST",
       ...(signal ? { signal } : {}),
     });
   },

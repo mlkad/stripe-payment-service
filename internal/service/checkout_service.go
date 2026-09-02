@@ -24,6 +24,10 @@ type CheckoutConfig struct {
 	// Required only when the frontend asks for the embedded presentation.
 	ReturnURL string
 
+	// PortalReturnURL is where Stripe sends the browser back after the customer
+	// finishes in the billing portal.
+	PortalReturnURL string
+
 	// AllowedPriceIDs restricts which prices a caller may check out against.
 	// Without it the price id is caller-controlled, and anyone who can reach the
 	// endpoint can subscribe themselves to the cheapest price in the account -
@@ -34,11 +38,17 @@ type CheckoutConfig struct {
 
 func (c CheckoutConfig) validate() error {
 	var problems []string
-	for name, raw := range map[string]string{"success_url": c.SuccessURL, "cancel_url": c.CancelURL, "return_url": c.ReturnURL} {
+	for name, raw := range map[string]string{
+		"success_url":       c.SuccessURL,
+		"cancel_url":        c.CancelURL,
+		"return_url":        c.ReturnURL,
+		"portal_return_url": c.PortalReturnURL,
+	} {
 		if raw == "" {
-			// return_url is optional: it is only needed for embedded checkout,
-			// and CreateCheckoutSession reports its absence at the point of use.
-			if name == "return_url" {
+			// Both return URLs are optional: each is needed only for one
+			// presentation, and the method that needs it says so at the point
+			// of use.
+			if name == "return_url" || name == "portal_return_url" {
 				continue
 			}
 			problems = append(problems, name+" is required")
@@ -168,4 +178,49 @@ func (s *CheckoutService) CreateCheckoutSession(ctx context.Context, req Checkou
 		URL:          session.URL,
 		ClientSecret: session.ClientSecret,
 	}, nil
+}
+
+// PortalResult is a link into Stripe's hosted billing portal.
+type PortalResult struct {
+	URL string
+}
+
+// CreatePortalSession opens the billing portal for a user.
+//
+// Requires a linked Stripe customer, which a user only has after their first
+// checkout completes. Before that there is nothing to manage, and the caller
+// gets domain.ErrNotFound rather than a portal showing an empty account.
+//
+// The customer id comes from the user row, never from the request. That is the
+// whole security boundary here: the returned URL authenticates its bearer as
+// that customer, so letting a caller name the customer would hand them
+// someone else's billing account.
+func (s *CheckoutService) CreatePortalSession(ctx context.Context, userID uuid.UUID) (*PortalResult, error) {
+	if s.cfg.PortalReturnURL == "" {
+		return nil, fmt.Errorf("%w: the billing portal is not configured on this deployment", domain.ErrValidation)
+	}
+
+	user, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("load user: %w", err)
+	}
+	if user.StripeCustomerID == nil {
+		return nil, fmt.Errorf("%w: no billing account for this user", domain.ErrNotFound)
+	}
+
+	session, err := s.stripe.CreatePortalSession(ctx, *user.StripeCustomerID, s.cfg.PortalReturnURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// The session id is logged; the URL is not. It is a bearer credential for
+	// the customer's billing account for as long as it lives.
+	s.log.InfoContext(ctx, "billing portal session created",
+		slog.String("user_id", user.ID.String()),
+		slog.String("session_id", session.ID))
+
+	return &PortalResult{URL: session.URL}, nil
 }

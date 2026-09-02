@@ -315,6 +315,47 @@ control: pointing the invoice path at the shared cursor makes the status stay
 Idempotency needs nothing new. The event ledger already makes a redelivery a
 no-op, which is what keeps `payment_failure_count` from double-counting.
 
+## Customer Portal
+
+`POST /api/v1/portal` returns a link into Stripe's hosted billing portal, where
+a customer cancels, switches plan, or updates their card.
+
+None of that is implemented here on purpose. The portal is Stripe-hosted, so
+card details never reach this service and PCI scope stays with Stripe, and the
+resulting changes arrive back through the `customer.subscription.*` webhooks
+already handled.
+
+**The request carries no customer id, and there is no field it could.** The
+returned URL authenticates its bearer as that Stripe customer for its lifetime,
+so the account is derived from the token subject only. It is also never logged —
+the session id is, the URL is not.
+
+What the portal permits is configured in the Stripe dashboard rather than here.
+That is deliberate on Stripe's part: the permissions live with the account, so a
+bug in this service cannot widen them.
+
+A user with no linked customer gets 404, not an error. They have not completed a
+checkout, there is nothing to manage, and the UI should offer a plan instead.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs four jobs on every push to `main` and every pull
+request: build and vet, unit tests, integration tests against a real
+PostgreSQL 16 service container, and the frontend typecheck and build.
+
+Details worth keeping:
+
+- **`go vet` runs under both tag sets.** The integration files only compile with
+  `-tags=integration`, so vetting once would leave them unchecked.
+- **`go mod tidy` must be a no-op.** A stale `go.mod` fails the build rather
+  than being silently corrected on someone's machine.
+- **The Go version comes from `go.mod`**, not a duplicated string, so a
+  toolchain bump cannot leave CI behind.
+- **Migrations are rolled all the way back** at the end of the integration job,
+  and a surviving table fails it. That is what keeps the down migrations honest.
+- **`npm ci`, not `npm install`** — it fails on a lockfile that has drifted from
+  `package.json` instead of quietly resolving something else.
+
 ## Rate limiting
 
 Applied to `POST /api/v1/auth/login` and `/register` only. Those are the only

@@ -176,13 +176,46 @@ func (h *StripeHandler) HandleCheckout(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type portalResponse struct {
+	URL string `json:"url"`
+}
+
+// HandlePortal opens Stripe's billing portal for the authenticated caller.
+//
+// This is where a customer cancels, switches plan, or updates their card. None
+// of that is implemented here on purpose: the portal is Stripe-hosted, so PCI
+// scope stays with them, and the resulting changes arrive back through the
+// customer.subscription.* webhooks this service already handles.
+//
+// There is no customer id in the request. The returned URL authenticates its
+// bearer as that customer, so it is derived from the token subject only.
+func (h *StripeHandler) HandlePortal(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	userID, err := middleware.UserIDFromContext(ctx)
+	if err != nil {
+		writeUnwiredRoute(w, h.log, ctx, err)
+		return
+	}
+
+	result, err := h.checkout.CreatePortalSession(ctx, userID)
+	if err != nil {
+		h.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, portalResponse{URL: result.URL})
+}
+
 // writeServiceError maps a use case failure onto a status code without leaking
 // upstream detail to the caller.
 func (h *StripeHandler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	ctx := r.Context()
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
-		writeError(w, http.StatusNotFound, "user not found")
+		// Covers both "no such user" and "no billing account yet". The caller
+		// is authenticated, so the second is the realistic case: they have not
+		// completed a checkout, and the UI should offer one.
+		writeError(w, http.StatusNotFound, "no billing account for this user")
 	case errors.Is(err, domain.ErrValidation), errors.Is(err, paystripe.ErrInvalidRequest):
 		h.log.WarnContext(ctx, "checkout rejected", slog.String("error", err.Error()))
 		writeError(w, http.StatusUnprocessableEntity, "request could not be fulfilled")
