@@ -23,7 +23,7 @@ interface UseSubscription {
  * usually under a second and occasionally much longer, so the dashboard polls
  * rather than showing a stale empty state.
  */
-export function useSubscription(userId: string, pollUntilActive = false): UseSubscription {
+export function useSubscription(pollUntilActive = false): UseSubscription {
   const [state, setState] = useState<State>({ status: "loading" });
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [nonce, setNonce] = useState(0);
@@ -32,8 +32,6 @@ export function useSubscription(userId: string, pollUntilActive = false): UseSub
   const refresh = useCallback(() => setNonce((n) => n + 1), []);
 
   useEffect(() => {
-    if (!userId) return;
-
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempt = 0;
@@ -41,7 +39,7 @@ export function useSubscription(userId: string, pollUntilActive = false): UseSub
     const load = async (): Promise<void> => {
       if (hasLoaded.current) setIsRefreshing(true);
       try {
-        const subscription = await api.getSubscription(userId, controller.signal);
+        const subscription = await api.getSubscription(controller.signal);
         hasLoaded.current = true;
         setState({ status: "ready", subscription });
 
@@ -71,7 +69,7 @@ export function useSubscription(userId: string, pollUntilActive = false): UseSub
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [userId, nonce, pollUntilActive]);
+  }, [nonce, pollUntilActive]);
 
   return { state, refresh, isRefreshing };
 }

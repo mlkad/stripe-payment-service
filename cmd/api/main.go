@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mlkad/stripe-payment-service/internal/auth"
 	"github.com/mlkad/stripe-payment-service/internal/config"
 	"github.com/mlkad/stripe-payment-service/internal/database"
 	"github.com/mlkad/stripe-payment-service/internal/handler"
@@ -128,6 +129,20 @@ func run() error {
 		return fmt.Errorf("build stripe client: %w", err)
 	}
 
+	hasher, err := auth.NewHasher(cfg.Auth.BcryptCost)
+	if err != nil {
+		return fmt.Errorf("build password hasher: %w", err)
+	}
+	tokens, err := auth.NewTokenService(auth.TokenConfig{
+		Secret:   cfg.Auth.JWTSecret.Reveal(),
+		Issuer:   cfg.Auth.JWTIssuer,
+		Audience: cfg.Auth.JWTAudience,
+		TTL:      cfg.Auth.AccessTokenTTL,
+	})
+	if err != nil {
+		return fmt.Errorf("build token service: %w", err)
+	}
+
 	userRepo := postgres.NewUserRepo(db.Pool())
 	subRepo := postgres.NewSubscriptionRepo(db.Pool())
 	webhookRepo := postgres.NewWebhookRepo(db.Pool(), 0)
@@ -144,17 +159,28 @@ func run() error {
 	}
 
 	subscriptionService := service.NewSubscriptionService(subRepo, log)
+	authService := service.NewAuthService(userRepo, hasher, tokens, log)
+
+	authRateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
+		Rate:  cfg.HTTP.AuthRateLimitRPS,
+		Burst: cfg.HTTP.AuthRateLimitBurst,
+	}, log)
+	defer authRateLimiter.Close()
 
 	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
 	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, log)
+	authHandler := handler.NewAuthHandler(authService, log)
 	healthHandler := handler.NewHealthHandler(db, log, version)
 
 	srv := &http.Server{
 		Addr: cfg.HTTP.Addr(),
-		Handler: handler.NewRouter(stripeHandler, subscriptionHandler, healthHandler, handler.RouterConfig{
+		Handler: handler.NewRouter(stripeHandler, subscriptionHandler, authHandler, healthHandler, handler.RouterConfig{
 			APITimeout:     cfg.HTTP.APITimeout,
 			WebhookTimeout: cfg.HTTP.WebhookTimeout,
 			CORS:           middleware.CORSConfig{AllowedOrigins: cfg.HTTP.CORSAllowedOrigins},
+			Tokens:         tokens,
+			AuthRateLimit:  authRateLimiter,
+			TrustedProxies: cfg.HTTP.TrustedProxies,
 		}, log),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,

@@ -48,6 +48,12 @@ var handledEventTypes = map[stripesdk.EventType]bool{
 	"customer.subscription.created": true,
 	"customer.subscription.paused":  true,
 	"customer.subscription.resumed": true,
+
+	// Invoice events drive dunning. payment_failed is the most commercially
+	// important event Stripe sends: it is where a renewal starts going wrong,
+	// and the window in which a customer can still be saved.
+	"invoice.payment_failed":    true,
+	"invoice.payment_succeeded": true,
 }
 
 type WebhookService struct {
@@ -167,6 +173,10 @@ func (s *WebhookService) dispatch(ctx context.Context, log *slog.Logger, event s
 		return s.handleCheckoutCompleted(ctx, log, event)
 	case "customer.subscription.deleted":
 		return s.handleSubscriptionChanged(ctx, log, event, true)
+	case "invoice.payment_succeeded":
+		return s.handleInvoicePayment(ctx, log, event, true)
+	case "invoice.payment_failed":
+		return s.handleInvoicePayment(ctx, log, event, false)
 	default:
 		return s.handleSubscriptionChanged(ctx, log, event, false)
 	}
@@ -390,6 +400,125 @@ func (s *WebhookService) upsertSubscription(
 
 	default:
 		return OutcomeFailed, fmt.Errorf("create subscription %s: %w", sub.ID, err)
+	}
+}
+
+// --- invoice.payment_* --------------------------------------------------------
+
+// handleInvoicePayment records a renewal outcome and maintains dunning state.
+//
+// It does not touch subscription status. Stripe decides what a failed payment
+// means - past_due when the subscription was active, incomplete on a first
+// invoice, canceled once retries run out - and reports it in a separate
+// customer.subscription.updated event. Deriving status here would race that
+// event and sometimes contradict it.
+func (s *WebhookService) handleInvoicePayment(ctx context.Context, log *slog.Logger, event stripesdk.Event, succeeded bool) (Outcome, error) {
+	var invoice stripesdk.Invoice
+	if err := json.Unmarshal(event.Data.Raw, &invoice); err != nil {
+		return OutcomeFailed, fmt.Errorf("decode invoice: %w", err)
+	}
+
+	subscriptionID := subscriptionIDOf(&invoice)
+	if subscriptionID == "" {
+		// One-off invoices and quote-generated invoices have no subscription.
+		// Nothing to record, and nothing wrong.
+		log.InfoContext(ctx, "invoice is not tied to a subscription",
+			slog.String("invoice_id", invoice.ID),
+			slog.String("billing_reason", string(invoice.BillingReason)))
+		return OutcomeSkipped, nil
+	}
+
+	update := repo.InvoicePaymentUpdate{
+		StripeSubscriptionID: subscriptionID,
+		Succeeded:            succeeded,
+		EventID:              event.ID,
+		EventCreatedAt:       time.Unix(event.Created, 0).UTC(),
+		NextAttemptAt:        unixPtr(invoice.NextPaymentAttempt),
+	}
+	if invoice.ID != "" {
+		update.InvoiceID = &invoice.ID
+	}
+	if succeeded {
+		// The invoice's period is the period actually paid for, which is what
+		// the subscription should now report.
+		update.CurrentPeriodStart = unixPtr(invoice.PeriodStart)
+		update.CurrentPeriodEnd = unixPtr(invoice.PeriodEnd)
+	} else if reason := declineReason(&invoice); reason != "" {
+		update.FailureReason = &reason
+	}
+
+	updated, err := s.subs.RecordInvoicePayment(ctx, update)
+	switch {
+	case err == nil:
+		if succeeded {
+			log.InfoContext(ctx, "invoice paid",
+				slog.String("subscription_id", subscriptionID),
+				slog.String("invoice_id", invoice.ID))
+		} else {
+			log.WarnContext(ctx, "invoice payment failed",
+				slog.String("subscription_id", subscriptionID),
+				slog.String("invoice_id", invoice.ID),
+				slog.Int("consecutive_failures", int(updated.PaymentFailureCount)),
+				slog.Int64("stripe_attempt_count", invoice.AttemptCount),
+				slog.Any("next_attempt_at", updated.NextPaymentAttemptAt))
+		}
+		return OutcomeProcessed, nil
+
+	case errors.Is(err, domain.ErrStaleEvent):
+		log.InfoContext(ctx, "invoice event superseded by a newer one",
+			slog.String("subscription_id", subscriptionID))
+		return OutcomeStale, nil
+
+	case errors.Is(err, domain.ErrNotFound):
+		// Unordered delivery again: the invoice can land before the
+		// subscription row exists. The invoice payload carries no items, so
+		// there is nothing to create the row from - acknowledge and let the
+		// subscription event do it.
+		log.WarnContext(ctx, "invoice for a subscription not yet recorded",
+			slog.String("subscription_id", subscriptionID))
+		return OutcomeSkipped, nil
+
+	default:
+		return OutcomeFailed, fmt.Errorf("record invoice payment for %s: %w", subscriptionID, err)
+	}
+}
+
+// subscriptionIDOf digs the subscription out of an invoice.
+//
+// Since the 2025 API versions it hangs off invoice.parent.subscription_details
+// rather than invoice.subscription, and the line items are the fallback for
+// invoices rendered before that move.
+func subscriptionIDOf(invoice *stripesdk.Invoice) string {
+	if p := invoice.Parent; p != nil && p.SubscriptionDetails != nil && p.SubscriptionDetails.Subscription != nil {
+		if id := p.SubscriptionDetails.Subscription.ID; id != "" {
+			return id
+		}
+	}
+	if invoice.Lines != nil {
+		for _, line := range invoice.Lines.Data {
+			if line != nil && line.Subscription != nil && line.Subscription.ID != "" {
+				return line.Subscription.ID
+			}
+		}
+	}
+	return ""
+}
+
+// declineReason renders something an operator - and eventually a customer - can
+// act on. Stripe's decline_code is the useful part; the generic message is the
+// fallback.
+func declineReason(invoice *stripesdk.Invoice) string {
+	err := invoice.LastFinalizationError
+	if err == nil {
+		return ""
+	}
+	switch {
+	case err.DeclineCode != "":
+		return fmt.Sprintf("%s: %s", err.DeclineCode, err.Msg)
+	case err.Code != "":
+		return fmt.Sprintf("%s: %s", err.Code, err.Msg)
+	default:
+		return err.Msg
 	}
 }
 
