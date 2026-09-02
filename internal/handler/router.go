@@ -139,6 +139,7 @@ func NewRouter(
 
 			r.Get("/auth/me", authHandler.HandleMe)
 			r.Post("/checkout", stripe.HandleCheckout)
+			r.Post("/portal", stripe.HandlePortal)
 			r.Get("/subscription", subs.HandleGetSubscription)
 		})
 	})

@@ -330,6 +330,46 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionIn
 	return out, nil
 }
 
+// --- billing portal -----------------------------------------------------------
+
+// PortalSession is a short-lived, single-use link into Stripe's hosted billing
+// portal, where a customer can cancel, switch plan, or update their card.
+type PortalSession struct {
+	ID  string
+	URL string
+}
+
+// CreatePortalSession opens a billing portal session for an existing customer.
+//
+// The URL it returns authenticates the bearer as that customer for its lifetime,
+// so it must be handed only to the authenticated owner and never logged,
+// emailed, or put in a redirect that a third party can observe.
+//
+// What the portal actually allows - cancel, switch plan, update payment method,
+// view invoices - is configured in the Stripe dashboard, not here. That is
+// deliberate on Stripe's part: the permissions live with the account, so a bug
+// in this service cannot widen them.
+func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL string) (*PortalSession, error) {
+	switch {
+	case !strings.HasPrefix(customerID, "cus_"):
+		return nil, fmt.Errorf("%w: customer id %q must begin with cus_", ErrInvalidRequest, customerID)
+	case returnURL == "":
+		return nil, fmt.Errorf("%w: return_url is required", ErrInvalidRequest)
+	}
+
+	params := &stripesdk.BillingPortalSessionCreateParams{
+		Customer:  stripesdk.String(customerID),
+		ReturnURL: stripesdk.String(returnURL),
+	}
+	params.Context = ctx
+
+	session, err := c.sdk.V1BillingPortalSessions.Create(ctx, params)
+	if err != nil {
+		return nil, classify("create billing portal session", err)
+	}
+	return &PortalSession{ID: session.ID, URL: session.URL}, nil
+}
+
 // --- subscriptions -----------------------------------------------------------
 
 // GetSubscription fetches a subscription with its items expanded.

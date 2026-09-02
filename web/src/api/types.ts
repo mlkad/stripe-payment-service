@@ -34,6 +34,10 @@ export interface CheckoutRequest {
   ui_mode?: UIMode;
 }
 
+export interface PortalSession {
+  url: string;
+}
+
 /** Exactly one of url and client_secret is present, matching the ui_mode asked
  *  for: url for the hosted redirect, client_secret for the embedded form. */
 export interface CheckoutSession {
