@@ -15,6 +15,10 @@ type RouterConfig struct {
 	// APITimeout bounds ordinary API requests.
 	APITimeout time.Duration
 
+	// CORS lists the browser origins allowed to call the API. Zero origins
+	// leaves the middleware out of the chain entirely.
+	CORS middleware.CORSConfig
+
 	// WebhookTimeout bounds webhook processing, and is deliberately the longer
 	// of the two: checkout.session.completed makes an outbound call to Stripe
 	// before it writes anything, so it inherits that client's timeout plus the
@@ -55,13 +59,20 @@ func (c RouterConfig) withDefaults() RouterConfig {
 // Timeout is applied per route group rather than globally: the health probes
 // carry their own short deadline and must stay answerable when everything else
 // is saturated.
-func NewRouter(stripe *StripeHandler, health *HealthHandler, cfg RouterConfig, log *slog.Logger) http.Handler {
+func NewRouter(stripe *StripeHandler, subs *SubscriptionHandler, health *HealthHandler, cfg RouterConfig, log *slog.Logger) http.Handler {
 	cfg = cfg.withDefaults()
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.AccessLog(log))
 	r.Use(middleware.Recoverer(log))
+
+	// CORS goes inside Recoverer but outside routing, so a preflight for an
+	// unmatched path still gets its headers rather than a bare 404 the browser
+	// reports as a CORS failure.
+	if len(cfg.CORS.AllowedOrigins) > 0 {
+		r.Use(middleware.CORS(cfg.CORS))
+	}
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -84,6 +95,7 @@ func NewRouter(stripe *StripeHandler, health *HealthHandler, cfg RouterConfig, l
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Timeout(cfg.APITimeout, log))
 		r.Post("/checkout", stripe.HandleCheckout)
+		r.Get("/subscription", subs.HandleGetSubscription)
 	})
 
 	return r

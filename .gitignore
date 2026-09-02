@@ -20,3 +20,8 @@ vendor/
 .idea/
 .vscode/
 *.swp
+
+# Frontend
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo

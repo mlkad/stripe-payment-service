@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+/* Dark-first palette. Tailwind v4 reads these as first-class utilities, so
+   `bg-surface` and `text-muted` work without a config file. */
+@theme {
+  --color-canvas: oklch(17% 0.012 265);
+  --color-surface: oklch(21% 0.014 265);
+  --color-raised: oklch(25% 0.016 265);
+  --color-line: oklch(31% 0.018 265);
+  --color-ink: oklch(97% 0.005 265);
+  --color-muted: oklch(70% 0.017 265);
+  --color-faint: oklch(56% 0.017 265);
+
+  --color-brand: oklch(64% 0.19 274);
+  --color-brand-soft: oklch(30% 0.10 274);
+
+  --color-ok: oklch(72% 0.17 158);
+  --color-ok-soft: oklch(29% 0.08 158);
+  --color-warn: oklch(78% 0.15 78);
+  --color-warn-soft: oklch(30% 0.07 78);
+  --color-bad: oklch(66% 0.20 22);
+  --color-bad-soft: oklch(29% 0.09 22);
+
+  --font-sans: "Inter var", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius-card: 1rem;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    /* Two very wide, very low-opacity radials. Reads as depth rather than as
+       decoration, and costs nothing to paint. */
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -20%, color-mix(in oklch, var(--color-brand) 18%, transparent), transparent),
+      radial-gradient(ellipse 60% 50% at 90% 110%, color-mix(in oklch, var(--color-brand) 10%, transparent), transparent);
+    background-attachment: fixed;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-[--radius-card] border border-line bg-surface/80 backdrop-blur-xl;
+  }
+}
+
+/* Stripe renders its embedded checkout inside an iframe it sizes itself; this
+   only bounds the scroll container we give it. */
+.embedded-checkout {
+  min-height: 24rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

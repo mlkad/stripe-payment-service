@@ -20,6 +20,10 @@ type CheckoutConfig struct {
 	SuccessURL string
 	CancelURL  string
 
+	// ReturnURL is where Stripe sends the browser after an embedded checkout.
+	// Required only when the frontend asks for the embedded presentation.
+	ReturnURL string
+
 	// AllowedPriceIDs restricts which prices a caller may check out against.
 	// Without it the price id is caller-controlled, and anyone who can reach the
 	// endpoint can subscribe themselves to the cheapest price in the account -
@@ -30,8 +34,13 @@ type CheckoutConfig struct {
 
 func (c CheckoutConfig) validate() error {
 	var problems []string
-	for name, raw := range map[string]string{"success_url": c.SuccessURL, "cancel_url": c.CancelURL} {
+	for name, raw := range map[string]string{"success_url": c.SuccessURL, "cancel_url": c.CancelURL, "return_url": c.ReturnURL} {
 		if raw == "" {
+			// return_url is optional: it is only needed for embedded checkout,
+			// and CreateCheckoutSession reports its absence at the point of use.
+			if name == "return_url" {
+				continue
+			}
 			problems = append(problems, name+" is required")
 			continue
 		}
@@ -82,11 +91,19 @@ type CheckoutRequest struct {
 	PriceID         string
 	Quantity        int64
 	TrialPeriodDays int64
+
+	// Embedded selects the in-app Stripe Elements form instead of a redirect to
+	// Stripe's hosted page.
+	Embedded bool
 }
 
 type CheckoutResult struct {
 	SessionID string
-	URL       string
+
+	// Exactly one of URL and ClientSecret is set, according to the presentation
+	// requested: URL for the hosted redirect, ClientSecret for the embedded form.
+	URL          string
+	ClientSecret string
 }
 
 // CreateCheckoutSession opens a Stripe Checkout session for an existing user.
@@ -107,6 +124,7 @@ func (s *CheckoutService) CreateCheckoutSession(ctx context.Context, req Checkou
 	}
 
 	in := paystripe.CheckoutSessionInput{
+		UIMode:   paystripe.UIModeHosted,
 		PriceID:  req.PriceID,
 		Quantity: req.Quantity,
 		// Carried through Stripe and returned on checkout.session.completed;
@@ -117,6 +135,14 @@ func (s *CheckoutService) CreateCheckoutSession(ctx context.Context, req Checkou
 		TrialPeriodDays:   req.TrialPeriodDays,
 		Metadata:          map[string]string{"user_id": user.ID.String()},
 	}
+	if req.Embedded {
+		if s.cfg.ReturnURL == "" {
+			return nil, fmt.Errorf("%w: embedded checkout is not configured on this deployment", domain.ErrValidation)
+		}
+		in.UIMode = paystripe.UIModeEmbedded
+		in.ReturnURL = s.cfg.ReturnURL
+	}
+
 	// Reusing the existing customer keeps one billing identity per user. Passing
 	// the email instead would let Stripe mint a second customer for someone who
 	// already has one.
@@ -137,5 +163,9 @@ func (s *CheckoutService) CreateCheckoutSession(ctx context.Context, req Checkou
 		slog.String("price_id", req.PriceID),
 		slog.Int64("quantity", req.Quantity),
 	)
-	return &CheckoutResult{SessionID: session.ID, URL: session.URL}, nil
+	return &CheckoutResult{
+		SessionID:    session.ID,
+		URL:          session.URL,
+		ClientSecret: session.ClientSecret,
+	}, nil
 }
