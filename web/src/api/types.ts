@@ -26,8 +26,8 @@ export interface Subscription {
 
 export type UIMode = "hosted" | "embedded";
 
+/** No user_id: the caller is the bearer token's subject. */
 export interface CheckoutRequest {
-  user_id: string;
   price_id: string;
   quantity?: number;
   trial_period_days?: number;
@@ -53,4 +53,29 @@ export interface Plan {
   interval: "month" | "year";
   features: string[];
   featured?: boolean;
+}
+
+/* --- auth ----------------------------------------------------------------- */
+
+export interface User {
+  id: string;
+  email: string;
+  full_name?: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  expires_at: string;
+  user: User;
+}
+
+export interface RegisterRequest {
+  email: string;
+  password: string;
+  full_name?: string;
+}
+
+export interface LoginRequest {
+  email: string;
+  password: string;
 }

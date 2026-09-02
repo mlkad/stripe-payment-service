@@ -19,6 +19,9 @@ type RouterConfig struct {
 	// leaves the middleware out of the chain entirely.
 	CORS middleware.CORSConfig
 
+	// Tokens verifies bearer credentials on protected routes.
+	Tokens middleware.TokenParser
+
 	// WebhookTimeout bounds webhook processing, and is deliberately the longer
 	// of the two: checkout.session.completed makes an outbound call to Stripe
 	// before it writes anything, so it inherits that client's timeout plus the
@@ -59,7 +62,14 @@ func (c RouterConfig) withDefaults() RouterConfig {
 // Timeout is applied per route group rather than globally: the health probes
 // carry their own short deadline and must stay answerable when everything else
 // is saturated.
-func NewRouter(stripe *StripeHandler, subs *SubscriptionHandler, health *HealthHandler, cfg RouterConfig, log *slog.Logger) http.Handler {
+func NewRouter(
+	stripe *StripeHandler,
+	subs *SubscriptionHandler,
+	authHandler *AuthHandler,
+	health *HealthHandler,
+	cfg RouterConfig,
+	log *slog.Logger,
+) http.Handler {
 	cfg = cfg.withDefaults()
 
 	r := chi.NewRouter()
@@ -94,8 +104,23 @@ func NewRouter(stripe *StripeHandler, subs *SubscriptionHandler, health *HealthH
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Timeout(cfg.APITimeout, log))
-		r.Post("/checkout", stripe.HandleCheckout)
-		r.Get("/subscription", subs.HandleGetSubscription)
+
+		// Public: obtaining a credential cannot itself require one.
+		r.Post("/auth/register", authHandler.HandleRegister)
+		r.Post("/auth/login", authHandler.HandleLogin)
+
+		// Everything below requires a valid bearer token. The subject is read
+		// from the token inside the handlers; no route here accepts a user id
+		// from the client, and RequireAuth is applied to the group rather than
+		// per-route so a new endpoint is protected by default rather than by
+		// remembering.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAuth(cfg.Tokens, log))
+
+			r.Get("/auth/me", authHandler.HandleMe)
+			r.Post("/checkout", stripe.HandleCheckout)
+			r.Get("/subscription", subs.HandleGetSubscription)
+		})
 	})
 
 	return r

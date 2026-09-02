@@ -5,7 +5,6 @@ import { formatMoney } from "@/lib/format";
 import { Alert, Button, Card } from "@/components/ui";
 
 interface PricingTableProps {
-  userId: string;
   plans: Plan[];
   currentPriceId?: string | undefined;
   /** "hosted" redirects to Stripe; "embedded" opens the in-app form. */
@@ -14,7 +13,6 @@ interface PricingTableProps {
 }
 
 export function PricingTable({
-  userId,
   plans,
   currentPriceId,
   mode,
@@ -28,7 +26,6 @@ export function PricingTable({
     setError(null);
     try {
       const session = await api.createCheckoutSession({
-        user_id: userId,
         price_id: plan.priceId,
         quantity: 1,
         ui_mode: mode,
