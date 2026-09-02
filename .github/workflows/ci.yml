@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR makes the previous run irrelevant. Cancelling it keeps the
+# queue short without cancelling anything on main, where every commit's result
+# is a record worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy is current
+        run: |
+          go mod tidy
+          if ! git diff --quiet go.mod go.sum; then
+            echo "::error::go.mod/go.sum are stale - run 'go mod tidy' and commit"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - run: go build ./...
+
+      # Both tag sets: the integration files only compile under the tag, so
+      # vetting without it would leave them unchecked.
+      - run: go vet ./...
+      - run: go vet -tags=integration ./...
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race -count=1 ./...
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: payments
+        ports: ["5432:5432"]
+        # The job must not start querying before the server accepts
+        # connections; without this the first test races the container.
+        options: >-
+          --health-cmd "pg_isready -U payments -d payments"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://payments:ci_password@localhost:5432/payments?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install goose
+        run: go install github.com/pressly/goose/v3/cmd/goose@latest
+
+      - name: Run migrations
+        env:
+          GOOSE_DRIVER: postgres
+          GOOSE_DBSTRING: ${{ env.TEST_DATABASE_URL }}
+        run: goose -dir migrations up
+
+      # The schema assertions are the contract the repositories are written
+      # against; running them before the tests turns a schema drift into a
+      # clear failure instead of a confusing one.
+      - name: Verify schema
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/verify-schema.sql
+
+      - name: Integration tests
+        run: go test -race -count=1 -tags=integration ./test/integration/...
+
+      - name: Migrations roll back cleanly
+        env:
+          GOOSE_DRIVER: postgres
+          GOOSE_DBSTRING: ${{ env.TEST_DATABASE_URL }}
+        run: |
+          goose -dir migrations reset
+          leftover=$(psql "$TEST_DATABASE_URL" -tAc \
+            "SELECT count(*) FROM information_schema.tables
+             WHERE table_schema='public' AND table_name <> 'goose_db_version';")
+          if [ "$leftover" != "0" ]; then
+            echo "::error::$leftover table(s) survived a full rollback"
+            exit 1
+          fi
+
+  web:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # `npm ci` rather than `npm install`: it fails on a lockfile that has
+      # drifted from package.json instead of quietly resolving something else.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build

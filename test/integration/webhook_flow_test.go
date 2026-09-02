@@ -62,8 +62,9 @@ func newWebhookStack(t *testing.T) (*service.WebhookService, http.Handler) {
 	)
 
 	checkout, err := service.NewCheckoutService(repo.NewUserRepo(pool), client, service.CheckoutConfig{
-		SuccessURL: "https://example.test/ok",
-		CancelURL:  "https://example.test/cancel",
+		SuccessURL:      "https://example.test/ok",
+		CancelURL:       "https://example.test/cancel",
+		PortalReturnURL: "https://example.test/billing",
 	}, log)
 	if err != nil {
 		t.Fatalf("build checkout service: %v", err)

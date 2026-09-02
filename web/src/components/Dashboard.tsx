@@ -2,6 +2,7 @@ import type { Subscription } from "@/api/types";
 import { ApiError } from "@/api/client";
 import { daysUntil, formatDate, formatMoney } from "@/lib/format";
 import { StatusBadge, describeStatus } from "@/components/StatusBadge";
+import { ManageBillingButton } from "@/components/ManageBillingButton";
 import { Alert, Button, Card, Skeleton, Spinner } from "@/components/ui";
 
 type State =
@@ -108,11 +109,10 @@ export function Dashboard({ state, isRefreshing, onRefresh, onChoosePlan }: Dash
         </div>
       )}
 
-      {!subscription.is_active && (
-        <div className="p-6 pt-5">
-          <Button onClick={onChoosePlan}>Choose a new plan</Button>
-        </div>
-      )}
+      <div className="flex flex-wrap items-start gap-3 p-6 pt-5">
+        <ManageBillingButton />
+        {!subscription.is_active && <Button onClick={onChoosePlan}>Choose a new plan</Button>}
+      </div>
     </Card>
   );
 }

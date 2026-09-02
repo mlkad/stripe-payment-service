@@ -173,6 +173,10 @@ type Stripe struct {
 	// checkout completes. Only needed when the frontend uses Stripe Elements.
 	CheckoutReturnURL string
 
+	// PortalReturnURL is where Stripe sends the browser back after the customer
+	// finishes in the billing portal.
+	PortalReturnURL string
+
 	// AllowedPriceIDs restricts what a checkout request may ask for. Empty means
 	// unrestricted, which Validate refuses in production: the price id arrives
 	// in the request body, so without an allowlist any caller can subscribe
@@ -269,6 +273,7 @@ func Load() (*Config, error) {
 			CheckoutSuccessURL: l.str("STRIPE_CHECKOUT_SUCCESS_URL", "http://localhost:3000/billing/success?session_id={CHECKOUT_SESSION_ID}"),
 			CheckoutCancelURL:  l.str("STRIPE_CHECKOUT_CANCEL_URL", "http://localhost:3000/billing/cancel"),
 			CheckoutReturnURL:  l.str("STRIPE_CHECKOUT_RETURN_URL", "http://localhost:5173/billing/return?session_id={CHECKOUT_SESSION_ID}"),
+			PortalReturnURL:    l.str("STRIPE_PORTAL_RETURN_URL", "http://localhost:5173/"),
 			AllowedPriceIDs:    l.csv("STRIPE_ALLOWED_PRICE_IDS"),
 		},
 		Auth: Auth{
@@ -459,13 +464,19 @@ func (c *Config) validateStripe() []error {
 		}
 	}
 
-	if raw := c.Stripe.CheckoutReturnURL; raw != "" {
+	for name, raw := range map[string]string{
+		"STRIPE_CHECKOUT_RETURN_URL": c.Stripe.CheckoutReturnURL,
+		"STRIPE_PORTAL_RETURN_URL":   c.Stripe.PortalReturnURL,
+	} {
+		if raw == "" {
+			continue
+		}
 		u, err := url.Parse(raw)
 		switch {
 		case err != nil || !u.IsAbs():
-			add("STRIPE_CHECKOUT_RETURN_URL must be an absolute URL (got %q)", raw)
+			add("%s must be an absolute URL (got %q)", name, raw)
 		case c.App.Environment.IsProduction() && u.Scheme != "https":
-			add("STRIPE_CHECKOUT_RETURN_URL must use https in production")
+			add("%s must use https in production", name)
 		}
 	}
 
