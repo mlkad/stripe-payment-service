@@ -41,7 +41,9 @@ func throttledStack(t *testing.T, burst int) http.Handler {
 
 	userRepo := repo.NewUserRepo(pool)
 	checkout, err := service.NewCheckoutService(userRepo, client, service.CheckoutConfig{
-		SuccessURL: "https://example.test/ok", CancelURL: "https://example.test/cancel",
+		SuccessURL:      "https://example.test/ok",
+		CancelURL:       "https://example.test/cancel",
+		PortalReturnURL: "https://example.test/billing",
 	}, log)
 	if err != nil {
 		t.Fatalf("checkout service: %v", err)

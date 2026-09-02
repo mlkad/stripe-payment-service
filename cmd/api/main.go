@@ -152,6 +152,7 @@ func run() error {
 		SuccessURL:      cfg.Stripe.CheckoutSuccessURL,
 		CancelURL:       cfg.Stripe.CheckoutCancelURL,
 		ReturnURL:       cfg.Stripe.CheckoutReturnURL,
+		PortalReturnURL: cfg.Stripe.PortalReturnURL,
 		AllowedPriceIDs: cfg.Stripe.AllowedPriceIDs,
 	}, log)
 	if err != nil {

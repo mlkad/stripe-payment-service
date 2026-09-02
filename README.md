@@ -115,5 +115,6 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 6** — React dashboard, Stripe Elements, entitlement read API
 - [x] **Step 7** — JWT authentication, protected routes, secure context
 - [x] **Step 8** — auth rate limiting, invoice events, dunning state
-- [ ] **Step 9** — Customer Portal, refresh tokens, failed-webhook alerting
-- [ ] **Step 10** — CI, observability, deployment
+- [x] **Step 9** — Customer Portal, CI pipeline
+- [ ] **Step 10** — failed-webhook alerting, payload retention, refresh tokens
+- [ ] **Step 11** — observability, deployment
