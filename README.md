@@ -1,127 +1,167 @@
 # Stripe Payment & Subscription Gateway
 
-A billing service in Go: checkout, subscription lifecycle, dunning, and the
-Customer Portal, with a React dashboard on top.
+Billing service in Go. Checkout, subscriptions, dunning, Customer Portal, React
+dashboard.
 
-I built it to get right the parts that usually go wrong — webhook idempotency,
-out-of-order events, and what happens after a payment fails. Most of the work is
-there rather than in the Stripe API calls.
+Calling the Stripe API is the easy part. This is about the rest: webhooks
+arriving twice, arriving out of order, arriving three days late, and what
+happens when a payment fails at 3am.
 
-**Go 1.25 · PostgreSQL 16 (pgx/v5) · chi · React 19 · Vite · Tailwind 4**
+**Go 1.25 · PostgreSQL 16 · pgx/v5 · chi · React 19 · Vite · Tailwind 4**
 
-Modular monolith: one binary, one database, workers as goroutines. The package
-boundaries are enforced, so the seams exist if it ever needs splitting. It does
-not — the guarantees below depend on single-database transactions, and
-distributing them would trade row locks for distributed locks to buy scale I do
-not have.
+Modular monolith. One binary, one database, workers as goroutines. The
+guarantees below are row locks in single transactions — splitting this into
+services would trade them for distributed locks to buy scale I don't have.
 
 ---
 
-## The parts worth reading
+## Six things that would break, and don't
 
-**Stripe delivers at least once, unordered, for three days.**
+Each one has a test. I broke the code to check the test noticed.
 
-`processed_webhooks.event_id` is the primary key, so the unique index does the
-mutual exclusion — no advisory locks. Claiming is `INSERT ... ON CONFLICT DO
-UPDATE ... WHERE`, and the `WHERE` decides who may retry: failed is reclaimable,
-processing only once the claim goes stale, succeeded never.
+### Remove the row lock, lose a subscription state
 
-For ordering, `subscriptions.last_stripe_event_at` holds the newest applied
-`event.created`; older events are acknowledged and discarded, so a stale retry
-cannot resurrect a canceled subscription. That guard reads, decides, then
-writes, which under READ COMMITTED is only atomic because the row is held with
-`SELECT ... FOR UPDATE`. Remove the lock and 18 assertions fail — two workers see
-the same pre-state and the last committer wins. Equal timestamps are applied,
-not rejected: `event.created` has one-second resolution and distinct events
-collide routinely.
+`SELECT ... FOR UPDATE` guards the out-of-order check. Under READ COMMITTED,
+read-decide-write is only atomic while the row is held.
 
-**Signature verification runs before the claim.**
+```
+--- FAIL: TestSubscriptionRepo_ConcurrentOutOfOrderEventsConverge
+    round 0: last_stripe_event_id = evt_R08, want evt_R23
+    round 0: status = "trialing", want "unpaid"
+    ... every round fails
+```
 
-`event_id` and `created` come from the request body, which is unauthenticated
-until the signature checks out. Claiming first would let someone POST a guessed
-event id, plant a settled row, and make Stripe's real delivery get dropped as a
-duplicate. I tested it rather than assuming: with the order reversed, a forged
-request creates a ledger row and the next delivery is answered `200` and never
+24 shuffled events per round, 8 rounds. Two workers read the same pre-state, and
+the last one to commit wins regardless of which event is newer.
+
+### Claim before verifying, and anyone can drop your webhooks
+
+`event_id` comes from the request body. Unauthenticated until the signature
+checks out. Claim first and someone can POST a guessed id, plant a settled row,
+and your real delivery gets discarded as a duplicate.
+
+```
+--- FAIL: TestWebhook_ForgedPayloadNeverReachesLedger/garbage_signature
+    forged payload created 1 ledger row(s); the claim ran before verification
+
+--- FAIL: .../valid_shape,_wrong_secret
+    status = 200, want 400
+```
+
+That second line is the attack landing. The row planted by the previous forged
+request made the next delivery look like a duplicate — answered `200`, never
 processed.
 
-**Invoice events get their own ordering cursor.**
+### Share one cursor between two event streams, silently lose the status
 
-Invoice and subscription events are separate streams that interleave. An
-`invoice.payment_failed` at T+5 would advance a shared cursor past a
-`customer.subscription.updated` at T+4 — and that one carries the authoritative
-status. Migration `00004` adds a second cursor so neither starves the other.
-Neither invoice handler writes `status`; Stripe decides what a failed payment
-means, and deriving it here would race the event that says so.
+Invoice and subscription events interleave. An `invoice.payment_failed` at T+5
+advances a shared cursor past a `customer.subscription.updated` at T+4 — and
+that one carries the real status.
 
-**Failed events do not sit there.**
+```
+--- FAIL: TestInvoice_DoesNotStarveTheSubscriptionEventStream
+    status = "active", want past_due: the invoice event advanced the
+    subscription cursor and starved the event carrying the real status
+```
 
-A sweeper reclaims claims abandoned by crashed workers, replays failed events
-from the stored payload, and logs at error level once anything is dead-lettered.
-Stripe gives up after three days, so a bug fixed on day four would otherwise
-leave three days of events permanently unprocessed.
+The customer's card failed. Your database says active. Migration `00004` gives
+each stream its own cursor.
 
-**Payloads expire, because they hold personal data.**
+### Forget to cancel a rate-limit reservation, lock out the victim
 
-Settled events lose their payload after 30 days; failed ones keep theirs for 90,
-since the sweeper replays from it. Past that they go anyway — a privacy
-obligation does not pause because a retry queue is stuck. What replaces the
-payload is an allowlisted skeleton, not a redaction: a denylist would start
-leaking the day Stripe adds a field nobody anticipated, and would look compliant
-while doing it. The reduction runs in SQL, so the data never reaches the app.
+`rate.Limiter.ReserveN` takes a token whether you proceed or not. A denial has
+to give it back.
 
-**Sessions.**
+```
+--- FAIL: TestRateLimiterRejectionDoesNotDeferRecovery
+    still throttled after a refill window; denials consumed tokens (delay=195ms)
+```
 
-15-minute access tokens in memory, 30-day refresh tokens in an httpOnly cookie
-scoped to `/api/v1/auth`. Rotation is unconditional. If a spent token comes back,
-either the thief or the victim is presenting one the other already used and
-there is no telling which, so the whole family is revoked. A false positive costs
-one login.
+Twenty denials pushed recovery from 10ms to 195ms. Under a brute-force attempt
+that compounds until the real user can never log in — the limiter punishing the
+person being attacked.
+
+### Rotate refresh tokens without detecting reuse, and theft is invisible
+
+Rotation limits the window. Recording that a token was *spent* is what catches
+the thief.
+
+```
+--- FAIL: TestRefresh_ReuseRevokesTheEntireFamily
+    the live token still works after reuse detection: status = 200
+```
+
+When a spent token comes back, either the thief or the victim is holding it and
+there's no telling which. Whole family revoked. False positive costs one login.
+
+### Hardcode a decoy hash, build the oracle you were preventing
+
+The unknown-account login path compares against a decoy so it costs the same as
+a real check. I hardcoded cost-12 against cost-10 stored hashes:
+
+```
+unknown account : 401  0.294s
+wrong password  : 401  0.065s
+```
+
+4.5x apart, and backwards. Louder than having no decoy at all. Found it by
+measuring, not reasoning. The decoy is now generated at the configured cost:
+
+```
+unknown 0.068  wrong-pw 0.065
+unknown 0.065  wrong-pw 0.065
+unknown 0.065  wrong-pw 0.064
+```
 
 ---
 
-## Running it
+## Two more, without the drama
+
+**Failed events don't sit there.** A sweeper reclaims claims from crashed
+workers and replays failures from the stored payload. Stripe gives up after
+three days — fix a bug on day four and those three days are gone otherwise.
+
+**Payloads expire, because they hold customer email and address.** Settled: 30
+days. Failed: 90, since the sweeper replays from them. Past that they go anyway;
+a privacy obligation doesn't pause because a queue is stuck. What's left is an
+allowlisted skeleton — a denylist starts leaking the day Stripe adds a field
+nobody anticipated, and looks compliant while doing it.
+
+---
+
+## Run it
 
 ```bash
 cp .env.example .env      # Stripe test keys, and a JWT_SECRET
 make up                   # postgres, migrations, api
 ```
 
-Webhooks need a listener, or checkout completes at Stripe and the database never
-hears about it:
+Webhooks need a listener or nothing reaches the database:
 
 ```bash
 stripe listen --forward-to localhost:8080/webhook
 ```
 
-Put the `whsec_` it prints into `.env` and restart. Then:
+Paste the `whsec_` into `.env`, restart. Then:
 
 ```bash
 cd web && cp .env.example .env && npm install && npm run dev
 ```
 
-`make help` lists the rest.
-
----
-
-## Tests
+## Test it
 
 ```bash
 make test                 # unit
-make test-integration     # against a real PostgreSQL
+make test-integration     # real PostgreSQL
 make verify-schema        # constraints, triggers, idempotency
 ```
 
 219 tests, 75% combined coverage, gated in CI.
 
-Where a property matters, the test was checked against a deliberately broken
-implementation — removing `FOR UPDATE`, reversing signature-then-claim, dropping
-the rate limiter's reservation cancel, pointing the invoice cursor at the
-subscription cursor. Each produces a failure, and each is noted where it lives.
-
-Two checks turned out not to have teeth and say so: the `alg:none` token test
-passes with or without `WithValidMethods`, because jwt/v5 refuses it
-independently, and the sweeper's claim-level attempts guard survives being
-neutered. Both guards stay; neither is claimed as proven.
+Two guards turned out **not** to be load-bearing, and the code says so: the
+`alg:none` test passes with or without `WithValidMethods` — jwt/v5 refuses it
+independently — and the sweeper's attempts guard survives being neutered. Both
+stay. Neither is claimed as proven.
 
 ---
 
@@ -131,23 +171,21 @@ neutered. Both guards stay; neither is claimed as proven.
 cmd/api                       composition root, shutdown, operator CLI
 internal/domain               entities and invariants. No I/O.
 internal/service              use cases
-internal/repository/postgres  pgx adapters and the ports they satisfy
+internal/repository/postgres  pgx adapters and their ports
 internal/stripe               the only package importing stripe-go
-internal/auth                 bcrypt policy, JWT, refresh tokens
-internal/handler              routing, middleware, HTTP surface
-internal/worker               webhook sweeper, payload retention
+internal/auth                 bcrypt, JWT, refresh tokens
+internal/handler              routing, middleware, HTTP
+internal/worker               sweeper, retention
 internal/config               env to typed config, validated at boot
 migrations                    schema, source of truth
 web                           React dashboard
 ```
 
-Four tables, six migrations, every `down` written and tested — a full reset
-leaves nothing behind, and CI checks that. Design notes in
+Four tables, six migrations. Every `down` is written and tested — a full reset
+leaves nothing behind and CI checks it. Design notes in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
----
-
-## Operating
+## Operate it
 
 ```
 GET  /livez /healthz
@@ -158,29 +196,27 @@ POST /api/v1/checkout  /api/v1/portal
 GET  /api/v1/subscription
 ```
 
-Liveness ignores the database on purpose: restarting the container cannot repair
-a database outage, and wiring liveness to it turns one blip into a restart loop.
-`/metrics` is on a separate listener, since it publishes request rates and
-business volume.
+Liveness ignores the database. Restarting the container can't fix a database
+outage — wire liveness to it and one blip becomes a restart loop. `/metrics`
+sits on a separate listener; it publishes request rates and business volume.
 
-Two subcommands exit non-zero when a human is needed, so cron can use them:
+Two subcommands exit non-zero when a human is needed, so cron can call them:
 
 ```bash
-api -webhook-report     # unsettled ledger; exits 2 on dead letters
-api -retention-run      # one retention pass; exits 2 if data is overdue
+api -webhook-report     # exits 2 on dead letters
+api -retention-run      # exits 2 if data is overdue
 ```
 
-`deployments/production` has a compose stack for a single VPS — Caddy with
-automatic TLS, the API, Postgres, Prometheus. Caddy is the only container that
-publishes ports.
+`deployments/production` has a single-VPS compose stack — Caddy with automatic
+TLS, API, Postgres, Prometheus. Caddy is the only container publishing ports.
 
 ---
 
 ## Not done
 
-- Plan changes and proration. A customer can subscribe and cancel, not upgrade.
-- Password reset and email verification, both of which need mail delivery.
-- Horizontal scaling. The rate limiter is per-instance, so N replicas means N
-  times the limit. The workers replicate safely; the limiter does not.
-- Alerting. Prometheus scrapes but there is no Alertmanager. The four rules
-  worth having are in `deployments/production/prometheus.yml`.
+- **Plan changes and proration.** Subscribe and cancel work. Upgrade doesn't.
+- **Password reset, email verification.** Both need mail delivery.
+- **Horizontal scaling.** The rate limiter is per-instance: N replicas, N times
+  the limit. Workers replicate fine; the limiter doesn't.
+- **Alerting.** Prometheus scrapes, no Alertmanager. The four rules worth having
+  are written down in `deployments/production/prometheus.yml`.
