@@ -17,6 +17,9 @@ type SubscriptionRepository interface {
 	GetLatestSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (*domain.Subscription, error)
 	UpdateSubscriptionStatus(ctx context.Context, in SubscriptionStatusUpdate) (*domain.Subscription, error)
 	RecordInvoicePayment(ctx context.Context, in InvoicePaymentUpdate) (*domain.Subscription, error)
+
+	// CountInDunning reports subscriptions with an outstanding payment failure.
+	CountInDunning(ctx context.Context) (int64, error)
 }
 
 // InvoicePaymentUpdate carries one invoice.payment_succeeded or
@@ -337,6 +340,19 @@ func derefOr(s *string, fallback string) string {
 		return fallback
 	}
 	return *s
+}
+
+// CountInDunning uses idx_subscriptions_dunning, which is partial on
+// payment_failed_at IS NOT NULL - so this scans only the rows in dunning rather
+// than the whole table.
+func (r *SubscriptionRepo) CountInDunning(ctx context.Context) (int64, error) {
+	const query = `SELECT count(*) FROM subscriptions WHERE payment_failed_at IS NOT NULL`
+
+	var n int64
+	if err := r.pool.QueryRow(ctx, query).Scan(&n); err != nil {
+		return 0, mapError("count subscriptions in dunning", err)
+	}
+	return n, nil
 }
 
 func nullIfEmpty(s string) *string {

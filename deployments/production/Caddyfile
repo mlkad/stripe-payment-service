@@ -1,0 +1,70 @@
+# Caddy fronts the API. It terminates TLS, obtains and renews certificates from
+# Let's Encrypt automatically, and is the only process on the box listening on
+# a public port.
+#
+# Certificates live in the caddy_data volume. Losing that volume means
+# re-issuing, and Let's Encrypt rate-limits issuance per domain per week, so
+# back it up or expect an outage after enough rebuilds.
+
+{
+	email {$ACME_EMAIL}
+
+	# Uncomment while testing DNS or firewall rules. The staging CA is not
+	# rate-limited but issues certificates browsers do not trust.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		# HSTS. Once a browser sees this it refuses plain HTTP for the domain
+		# for a year, so do not enable it until HTTPS is known to work -
+		# there is no quick way to undo it for visitors who already have it.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+
+		# The API returns JSON and the UI loads Stripe's embedded checkout,
+		# which needs its script and frame origins allowed.
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://js.stripe.com; frame-src https://js.stripe.com https://hooks.stripe.com; connect-src 'self' https://api.stripe.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'"
+
+		# Caddy's own version is not information anyone needs.
+		-Server
+	}
+
+	# Stripe posts webhooks here. No rate limiting in front of it: a 429 tells
+	# Stripe to redeliver, so throttling builds a retry backlog instead of
+	# shedding load. The application bounds the body at 256 KiB.
+	handle /webhook {
+		reverse_proxy api:8080
+	}
+
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+
+	handle /healthz {
+		reverse_proxy api:8080
+	}
+
+	handle /livez {
+		reverse_proxy api:8080
+	}
+
+	# /metrics is deliberately absent. It lives on the API's second listener,
+	# which is reachable only inside the compose network. Adding a route here
+	# would publish request rates, error counts and business volume.
+
+	handle {
+		respond "Not Found" 404
+	}
+
+	log {
+		output stdout
+		format json
+		level INFO
+	}
+}

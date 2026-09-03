@@ -26,6 +26,7 @@ import (
 	"github.com/mlkad/stripe-payment-service/internal/handler"
 	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
 	"github.com/mlkad/stripe-payment-service/internal/logger"
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	"github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
@@ -180,8 +181,13 @@ func run() error {
 
 	subscriptionService := service.NewSubscriptionService(subRepo, log)
 	refreshRepo := postgres.NewRefreshTokenRepo(db.Pool())
+	// Built before the workers, which publish gauges into it.
+	metricsRegistry := metrics.New()
+	webhookService.WithMetrics(metricsRegistry)
+
 	authService := service.NewAuthService(
-		userRepo, refreshRepo, hasher, tokens, cfg.Auth.RefreshTokenTTL, log)
+		userRepo, refreshRepo, hasher, tokens, cfg.Auth.RefreshTokenTTL, log).
+		WithMetrics(metricsRegistry)
 
 	authRateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
 		Rate:  cfg.HTTP.AuthRateLimitRPS,
@@ -190,7 +196,8 @@ func run() error {
 	defer authRateLimiter.Close()
 
 	if cfg.Retention.Enabled {
-		retention := worker.NewRetentionWorker(webhookRepo, refreshRepo, retentionConfig(cfg), log)
+		retention := worker.NewRetentionWorker(webhookRepo, refreshRepo, retentionConfig(cfg), log).
+			WithMetrics(metricsRegistry)
 		go retention.Run(signalCtx)
 	} else {
 		log.Warn("payload retention is disabled; stored webhook payloads keep customer " +
@@ -198,7 +205,8 @@ func run() error {
 	}
 
 	if cfg.Sweeper.Enabled {
-		sweeper := worker.NewWebhookSweeper(webhookRepo, webhookService, sweeperConfig(cfg), log)
+		sweeper := worker.NewWebhookSweeper(webhookRepo, webhookService, sweeperConfig(cfg), log).
+			WithMetrics(metricsRegistry, subRepo)
 		// Bound by signalCtx so the sweeper stops as soon as shutdown begins,
 		// rather than starting a batch the drain would then wait on.
 		go sweeper.Run(signalCtx)
@@ -223,6 +231,7 @@ func run() error {
 			Tokens:         tokens,
 			AuthRateLimit:  authRateLimiter,
 			TrustedProxies: cfg.HTTP.TrustedProxies,
+			Metrics:        metricsRegistry,
 		}, log),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
@@ -237,6 +246,35 @@ func run() error {
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", srv.Addr, err)
+	}
+
+	// The metrics listener is separate so /metrics cannot be reached by adding
+	// a path to the public API - only by reaching a port the reverse proxy
+	// never exposes.
+	var metricsSrv *http.Server
+	if addr := cfg.HTTP.MetricsAddr(); addr != "" {
+		metricsSrv = &http.Server{
+			Addr:              addr,
+			Handler:           handler.NewAdminRouter(metricsRegistry, log),
+			ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
+			ReadTimeout:       cfg.HTTP.ReadTimeout,
+			WriteTimeout:      cfg.HTTP.WriteTimeout,
+			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+			BaseContext:       func(net.Listener) context.Context { return context.Background() },
+		}
+		metricsLn, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("listen for metrics on %s: %w", addr, err)
+		}
+		go func() {
+			log.Info("metrics listener started", slog.String("addr", addr))
+			if err := metricsSrv.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// Not fatal: losing metrics must not take down the API.
+				log.Error("metrics listener stopped", slog.String("error", err.Error()))
+			}
+		}()
+	} else {
+		log.Warn("metrics are disabled; METRICS_PORT is 0")
 	}
 
 	serveErr := make(chan error, 1)
@@ -269,6 +307,12 @@ func run() error {
 	// Order is load-bearing: drain HTTP first, then close the pool. Closing the
 	// pool first would tear connections out from under requests that are still
 	// finishing, potentially mid-transaction.
+	// Metrics first: a scrape in flight is not worth waiting on, and stopping
+	// it early keeps the drain that follows uncontended.
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed, forcing close", slog.String("error", err.Error()))
 		if closeErr := srv.Close(); closeErr != nil {

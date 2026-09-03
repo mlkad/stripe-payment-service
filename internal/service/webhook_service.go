@@ -14,6 +14,7 @@ import (
 	stripesdk "github.com/stripe/stripe-go/v86"
 
 	"github.com/mlkad/stripe-payment-service/internal/domain"
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
 )
@@ -57,11 +58,25 @@ var handledEventTypes = map[stripesdk.EventType]bool{
 }
 
 type WebhookService struct {
-	users  repo.UserRepository
-	subs   repo.SubscriptionRepository
-	hooks  repo.WebhookRepository
-	stripe *paystripe.Client
-	log    *slog.Logger
+	users   repo.UserRepository
+	subs    repo.SubscriptionRepository
+	hooks   repo.WebhookRepository
+	stripe  *paystripe.Client
+	metrics *metrics.Registry
+	log     *slog.Logger
+}
+
+// WithMetrics attaches instrumentation. Optional so tests and the CLI can build
+// the service without a registry.
+func (s *WebhookService) WithMetrics(m *metrics.Registry) *WebhookService {
+	s.metrics = m
+	return s
+}
+
+func (s *WebhookService) observe(eventType, outcome string, started time.Time) {
+	if s.metrics != nil {
+		s.metrics.ObserveWebhook(eventType, outcome, time.Since(started).Seconds())
+	}
 }
 
 func NewWebhookService(
@@ -89,8 +104,14 @@ func NewWebhookService(
 // committed on its own so that a crashed worker leaves a reclaimable row behind
 // rather than vanishing without trace.
 func (s *WebhookService) ProcessEvent(ctx context.Context, payload []byte, signatureHeader string) (Outcome, error) {
+	started := time.Now()
+
 	event, err := s.stripe.VerifyWebhook(payload, signatureHeader)
 	if err != nil {
+		// Labelled "unverified" rather than by type: the type comes from the
+		// body, which is not trustworthy until the signature checks out, and
+		// an attacker choosing label values is unbounded cardinality.
+		s.observe("unverified", "signature_rejected", started)
 		return OutcomeFailed, err
 	}
 
@@ -122,6 +143,7 @@ func (s *WebhookService) ProcessEvent(ctx context.Context, payload []byte, signa
 	}
 	if !claimed {
 		log.InfoContext(ctx, "event already settled or in flight")
+		s.observe(string(event.Type), string(OutcomeDuplicate), started)
 		return OutcomeDuplicate, nil
 	}
 	log = log.With(slog.Int("attempt", int(record.Attempts)))
@@ -142,6 +164,7 @@ func (s *WebhookService) ProcessEvent(ctx context.Context, payload []byte, signa
 		log.ErrorContext(ctx, "event processing failed",
 			slog.String("error", err.Error()),
 			slog.Bool("retryable", paystripe.IsRetryable(err)))
+		s.observe(string(event.Type), string(OutcomeFailed), started)
 		return OutcomeFailed, err
 	}
 
@@ -156,6 +179,7 @@ func (s *WebhookService) ProcessEvent(ctx context.Context, payload []byte, signa
 			slog.String("error", err.Error()))
 	}
 	log.InfoContext(ctx, "event processed", slog.String("outcome", string(outcome)))
+	s.observe(string(event.Type), string(outcome), started)
 	return outcome, nil
 }
 

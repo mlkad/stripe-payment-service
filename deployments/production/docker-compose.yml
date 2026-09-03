@@ -1,0 +1,192 @@
+# Production stack for a single self-hosted VPS.
+#
+#   docker compose -f deployments/production/docker-compose.yml --env-file .env.production up -d
+#
+# Shape of the thing: Caddy is the only container with published ports. Every
+# other service listens on the internal network only, so the API cannot be
+# reached except through the proxy, Postgres cannot be reached from the internet
+# at all, and /metrics is not exposed outside the compose network.
+#
+# That matters more than it sounds on a VPS. Docker writes its own iptables
+# rules and a published port bypasses ufw, so "I have a firewall" is not a
+# defence against a stray `ports:` entry. The defence is not publishing it.
+
+name: stripe-payment-service
+
+x-logging: &logging
+  driver: json-file
+  options:
+    # Without this the JSON logs grow until the disk fills, which on a single
+    # VPS takes the database down with it.
+    max-size: "10m"
+    max-file: "5"
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    <<: *restart
+    logging: *logging
+    # The only published ports in the stack.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates; losing this re-issues and can hit rate limits
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required for certificate expiry notices}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [edge]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+      target: api
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    <<: *restart
+    logging: *logging
+    # No ports. Reachable only from caddy and prometheus on the internal network.
+    env_file: [../../.env.production]
+    environment:
+      APP_ENV: production
+      HTTP_PORT: 8080
+      METRICS_PORT: 9091
+      DATABASE_URL: postgres://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-payments}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The image is distroless - no shell, no curl - so the binary probes
+      # itself. Liveness, not readiness: restarting the API cannot fix a
+      # database outage, and a readiness-based healthcheck would turn a blip
+      # into a restart loop.
+      test: ["CMD", "/app/api", "-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Defence in depth, cheap to apply.
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          # A leak or a runaway query should hit a wall before it takes the
+          # host's memory and, with it, Postgres.
+          memory: 512M
+        reservations:
+          memory: 128M
+    # Both networks: edge to receive from Caddy and to reach api.stripe.com,
+    # backend to reach Postgres. It publishes no ports on either, so being on a
+    # network with egress does not make it reachable from outside.
+    networks: [edge, backend]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+      target: migrator
+    # One-shot: runs to completion before the API starts, then exits.
+    restart: "no"
+    logging: *logging
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: >-
+        host=postgres port=5432
+        user=${POSTGRES_USER:-payments}
+        password=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+        dbname=${POSTGRES_DB:-payments}
+        sslmode=disable
+    command: ["up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  postgres:
+    image: postgres:16-alpine
+    <<: *restart
+    logging: *logging
+    # No ports, deliberately. Reach it with:
+    #   docker compose exec postgres psql -U payments payments
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      # Data checksums catch silent corruption from a failing disk, which is
+      # the failure mode a single VPS has no redundancy against.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U ${POSTGRES_USER:-payments} -d ${POSTGRES_DB:-payments}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks: [backend]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    <<: *restart
+    logging: *logging
+    # No published port. Reach the UI over an SSH tunnel:
+    #   ssh -L 9090:localhost:9090 vps -- docker compose port prometheus 9090
+    # Exposing it would publish every metric to the internet.
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 15 days is plenty for a single VPS and bounds the disk this can take.
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks: [backend]
+
+networks:
+  # Caddy and the API. Not marked internal, because the API has to reach
+  # api.stripe.com - `internal: true` blocks egress, not just ingress, and a
+  # webhook handler that cannot call Stripe fails in a way that looks like a
+  # Stripe outage.
+  #
+  # Being on this network does not make a service reachable from outside;
+  # publishing a port does, and only Caddy does that.
+  edge:
+
+  # Postgres, the migrator and Prometheus. Genuinely internal: none of them has
+  # any business making an outbound connection, so egress is blocked.
+  backend:
+    internal: true
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  caddy_data:
+  caddy_config:
