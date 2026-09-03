@@ -83,7 +83,7 @@ person being attacked.
 
 ### Rotate refresh tokens without detecting reuse, and theft is invisible
 
-Rotation limits the window. Recording that a token was *spent* is what catches
+Rotation limits the window. Recording that a token was _spent_ is what catches
 the thief.
 
 ```
@@ -152,9 +152,16 @@ cd web && cp .env.example .env && npm install && npm run dev
 
 ```bash
 make test                 # unit
-make test-integration     # real PostgreSQL
+make test-integration     # real PostgreSQL, in its own database
 make verify-schema        # constraints, triggers, idempotency
 ```
+
+The integration suite TRUNCATEs every table between cases, so it runs against a
+separate `payments_test` database that `make test-integration` creates for you.
+It refuses to start if the target database is not named as a test database —
+`DATABASE_URL` is deliberately not consulted, because honouring it means a
+developer with a shell configured for staging runs a suite whose first act is to
+wipe the users table.
 
 219 tests, 75% combined coverage, gated in CI.
 
@@ -209,14 +216,3 @@ api -retention-run      # exits 2 if data is overdue
 
 `deployments/production` has a single-VPS compose stack — Caddy with automatic
 TLS, API, Postgres, Prometheus. Caddy is the only container publishing ports.
-
----
-
-## Not done
-
-- **Plan changes and proration.** Subscribe and cancel work. Upgrade doesn't.
-- **Password reset, email verification.** Both need mail delivery.
-- **Horizontal scaling.** The rate limiter is per-instance: N replicas, N times
-  the limit. Workers replicate fine; the limiter doesn't.
-- **Alerting.** Prometheus scrapes, no Alertmanager. The four rules worth having
-  are written down in `deployments/production/prometheus.yml`.

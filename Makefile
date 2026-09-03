@@ -19,6 +19,14 @@ include .env
 export
 endif
 
+
+# The integration suite TRUNCATEs every table, so it gets its own database.
+# Never point TEST_DSN at the development one.
+POSTGRES_USER     ?= payments
+POSTGRES_PASSWORD ?= local_dev_pw
+TEST_DB           ?= payments_test
+TEST_DSN          ?= postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:5440/$(TEST_DB)?sslmode=disable
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -91,9 +99,20 @@ run: ## Run the API against the local database
 test: ## Run unit tests with the race detector
 	go test -race -count=1 ./...
 
+.PHONY: test-db
+test-db: ## Create and migrate the dedicated test database
+	@# PGPASSWORD is passed explicitly: without it psql prompts on stdin and the
+	@# target hangs rather than failing, which is a confusing way to wait forever.
+	@docker compose exec -T -e PGPASSWORD=$(POSTGRES_PASSWORD) postgres \
+		psql -U $(POSTGRES_USER) -d postgres -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='$(TEST_DB)'" | grep -q 1 \
+		|| docker compose exec -T -e PGPASSWORD=$(POSTGRES_PASSWORD) postgres \
+			createdb -U $(POSTGRES_USER) $(TEST_DB)
+	@GOOSE_DRIVER=postgres GOOSE_DBSTRING="$(TEST_DSN)" goose -dir migrations up
+
 .PHONY: test-integration
-test-integration: ## Run integration tests against a live PostgreSQL (make up)
-	go test -race -count=1 -tags=integration ./test/integration/...
+test-integration: test-db ## Run integration tests against the test database
+	@TEST_DATABASE_URL="$(TEST_DSN)" go test -race -count=1 -tags=integration ./test/integration/...
 
 .PHONY: cover
 cover: ## Generate and open a coverage report

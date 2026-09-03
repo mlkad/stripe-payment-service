@@ -13,7 +13,9 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,15 +24,24 @@ import (
 
 var pool *pgxpool.Pool
 
-const defaultTestDSN = "postgres://payments:local_dev_pw@localhost:5440/payments?sslmode=disable"
+// defaultTestDSN targets a database dedicated to tests, not the one used for
+// development. These tests TRUNCATE every table between cases, so pointing them
+// at a working database destroys whatever is in it.
+const defaultTestDSN = "postgres://payments:local_dev_pw@localhost:5440/payments_test?sslmode=disable"
 
+// DATABASE_URL is deliberately NOT consulted. It is the application's own
+// connection string, so honouring it here means a developer with a shell
+// configured for staging - or production - runs a suite whose first act is to
+// truncate the users table. Only TEST_DATABASE_URL is read, and even that is
+// checked below.
 func TestMain(m *testing.M) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		dsn = os.Getenv("DATABASE_URL")
-	}
-	if dsn == "" {
 		dsn = defaultTestDSN
+	}
+	if err := refuseNonTestDatabase(dsn); err != nil {
+		fmt.Fprintf(os.Stderr, "integration: %v\n", err)
+		os.Exit(1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -44,7 +55,7 @@ func TestMain(m *testing.M) {
 	}
 	if err := pool.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "integration: database unreachable at %s: %v\n"+
-			"start it with `make up`, or set TEST_DATABASE_URL\n", redactDSN(dsn), err)
+			"create it with `make test-db`, or set TEST_DATABASE_URL\n", redactDSN(dsn), err)
 		os.Exit(1)
 	}
 
@@ -62,6 +73,33 @@ func truncate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+}
+
+// refuseNonTestDatabase is the last line of defence before the first TRUNCATE.
+//
+// The name has to say it is a test database. That is a blunt rule, and it is
+// the point: any subtler check is one someone talks themselves past at 2am,
+// and the cost of being wrong is a wiped table with no undo.
+func refuseNonTestDatabase(dsn string) error {
+	name, err := databaseName(dsn)
+	if err != nil {
+		return fmt.Errorf("cannot read the database name from the connection string: %w", err)
+	}
+	if !strings.Contains(strings.ToLower(name), "test") {
+		return fmt.Errorf(
+			"refusing to run: these tests TRUNCATE every table, and %q is not named "+
+				"as a test database.\nUse a database with \"test\" in its name "+
+				"(`make test-db` creates one), or set TEST_DATABASE_URL", name)
+	}
+	return nil
+}
+
+func databaseName(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(u.Path, "/"), nil
 }
 
 func ptr[T any](v T) *T { return &v }
