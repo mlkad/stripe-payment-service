@@ -234,6 +234,61 @@ gets an error rather than a zero uuid it might mistake for a user, and answers
 token, which would make an endpoint accidentally mounted outside `RequireAuth`
 look protected while enforcing nothing.
 
+### Sessions: rotating refresh tokens
+
+The access token is stateless and cannot be revoked before it expires, so its
+lifetime was the entire containment window for a stolen one. It is now 15
+minutes, renewed against a refresh token that *is* revocable.
+
+| | Access token | Refresh token |
+|---|---|---|
+| Lifetime | 15 minutes | 30 days |
+| Where | memory only, `Authorization` header | httpOnly cookie, `/api/v1/auth` |
+| Readable by script | yes | **no** |
+| Revocable | no | yes |
+
+That split is the point: the token an XSS can reach expires in minutes, and the
+one that lasts a month is unreachable. The access token is not in
+`localStorage` either — only a non-sensitive boolean hint is, so the shell knows
+to wait for a renewal on reload rather than flashing the login form.
+
+**Rotation is unconditional.** Every renewal consumes the presented token and
+issues a successor, so a leaked token is useful only until the legitimate
+client next refreshes.
+
+**Reuse detection is what makes rotation more than a window.** Rotation alone
+limits exposure; recording that a token was already consumed detects it. If a
+spent token comes back, either the thief or the victim is presenting a token the
+other has already used, and there is no way to tell which — so the whole family
+is revoked and both sign in again. A false positive costs one login; a false
+negative costs the account.
+
+The exchange happens in one transaction with the row locked, for the same
+reason the subscription guard locks: two requests with the same token would
+otherwise both find it unused and both succeed, which is precisely the case
+reuse detection exists to catch, missed because the detector raced.
+`TestRefresh_ConcurrentUseOfOneTokenElectsOneWinner` covers that;
+`TestRefresh_ReuseRevokesTheEntireFamily` fails if family revocation is removed.
+
+The token is never stored. It is 256 bits from `crypto/rand`, so the column
+holds a SHA-256 — enough to look up, useless if the table leaks. bcrypt would be
+the wrong tool: there is no dictionary attack to slow down against that much
+entropy, and it would put 250ms on every renewal.
+
+**CSRF.** Introducing a cookie introduces CSRF exposure, and `SameSite=Strict`
+is what answers it: the browser attaches the cookie to no cross-site request at
+all. The rest of the API is unaffected either way, since it authenticates with a
+`Bearer` header that a cross-site form cannot set. The cookie is also scoped to
+`/api/v1/auth`, so it is not attached to ordinary API calls at all.
+
+This assumes the UI and API are same-site. A cross-site deployment would need
+`SameSite=None`, which reopens CSRF and would need a token pattern instead.
+
+Expired tokens are deleted by the retention worker after a grace period —
+deleted rather than minimised, because an expired refresh token is not an audit
+record. The grace period exists so reuse detection still fires on a token that
+expired between theft and use.
+
 ### Login does not disclose whether an account exists
 
 Both "no such user" and "wrong password" return the same status and the same

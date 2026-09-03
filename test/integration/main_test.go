@@ -53,12 +53,12 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// truncate resets the three tables between tests. CASCADE is safe here because
-// the schema has no tables outside this set.
+// truncate resets the tables between tests. CASCADE is safe here because the
+// schema has no tables outside this set.
 func truncate(t *testing.T) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
-		`TRUNCATE processed_webhooks, subscriptions, users CASCADE`)
+		`TRUNCATE processed_webhooks, refresh_tokens, subscriptions, users CASCADE`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

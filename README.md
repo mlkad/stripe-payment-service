@@ -119,5 +119,5 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 10** — webhook sweeper: dead-letter recovery and alerting
 - [x] **Step 11** — payload retention and PII minimisation
 - [x] **Step 12** — unit test coverage, coverage gate in CI
-- [ ] **Step 13** — refresh tokens
+- [x] **Step 13** — rotating refresh tokens with reuse detection
 - [ ] **Step 14** — observability, deployment

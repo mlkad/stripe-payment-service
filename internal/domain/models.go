@@ -28,6 +28,11 @@ var (
 	// ErrEventNotClaimed means a settle call found no row in the processing
 	// state - the event was already settled, or another worker holds the claim.
 	ErrEventNotClaimed = errors.New("webhook event is not claimed for processing")
+
+	// ErrTokenReused means a refresh token that was already exchanged came
+	// back. It is not a validation failure but a signal of theft: the whole
+	// rotation family is revoked and every session for it ends.
+	ErrTokenReused = errors.New("refresh token was already used")
 )
 
 // FieldError attributes a validation failure to a specific field.
@@ -305,6 +310,40 @@ func (s *Subscription) IsLive() bool { return s.Status.IsLive() }
 // which is the whole point - access continues while Stripe retries, and the
 // customer is told rather than locked out.
 func (s *Subscription) InDunning() bool { return s.PaymentFailedAt != nil }
+
+// RefreshToken is one link in a rotation chain.
+//
+// The token itself is never stored or carried here; TokenHash is the SHA-256
+// the repository looks up by.
+type RefreshToken struct {
+	ID     uuid.UUID `json:"-"`
+	UserID uuid.UUID `json:"-"`
+
+	// TokenHash is never serialised: it is the lookup key for a live
+	// credential, and a response carrying it would be as good as the token.
+	TokenHash string `json:"-"`
+
+	// FamilyID groups every token descended from one login. Reuse detection
+	// revokes the family rather than the single token.
+	FamilyID uuid.UUID `json:"-"`
+
+	IssuedAt  time.Time `json:"-"`
+	ExpiresAt time.Time `json:"-"`
+
+	// UsedAt marks the token as exchanged. A used token presented again is
+	// treated as theft.
+	UsedAt        *time.Time `json:"-"`
+	RevokedAt     *time.Time `json:"-"`
+	RevokedReason *string    `json:"-"`
+
+	CreatedAt time.Time `json:"-"`
+	UpdatedAt time.Time `json:"-"`
+}
+
+// Usable reports whether the token may still be exchanged.
+func (t *RefreshToken) Usable(now time.Time) bool {
+	return t.RevokedAt == nil && t.UsedAt == nil && now.Before(t.ExpiresAt)
+}
 
 // ProcessedWebhook is one row of the idempotency ledger.
 type ProcessedWebhook struct {
