@@ -55,7 +55,7 @@ export function CheckoutModal({ clientSecret, onClose }: CheckoutModalProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-canvas/80 p-4 backdrop-blur-sm sm:p-8"
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-canvas/85 p-4 backdrop-blur-md sm:p-8"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
@@ -66,12 +66,12 @@ export function CheckoutModal({ clientSecret, onClose }: CheckoutModalProps) {
         aria-modal="true"
         aria-label="Complete your subscription"
         tabIndex={-1}
-        className="card my-auto w-full max-w-2xl overflow-hidden shadow-2xl outline-none"
+        className="panel my-auto w-full max-w-2xl overflow-hidden outline-none"
       >
-        <header className="flex items-center justify-between border-b border-line px-6 py-4">
+        <header className="flex items-center justify-between border-b border-white/[0.07] px-7 py-5">
           <div>
-            <h2 className="text-base font-semibold">Complete your subscription</h2>
-            <p className="mt-0.5 text-xs text-faint">Payments are processed by Stripe.</p>
+            <h2 className="font-display text-lg text-ink">Complete your subscription</h2>
+            <p className="mt-1 text-xs text-faint">Payments are processed by Stripe.</p>
           </div>
           <Button variant="ghost" onClick={onClose} aria-label="Close checkout" className="px-2.5">
             <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="size-5">
