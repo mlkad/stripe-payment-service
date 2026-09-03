@@ -38,7 +38,7 @@ export function ManageBillingButton() {
 
   return (
     <div className="space-y-3">
-      <Button variant="secondary" loading={isOpening} onClick={() => void openPortal()}>
+      <Button variant="outline" loading={isOpening} onClick={() => void openPortal()}>
         {isOpening ? "Opening…" : "Manage billing"}
       </Button>
       {error && <Alert title={error} tone="error" />}

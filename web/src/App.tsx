@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import type { Plan } from "@/api/types";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { useSubscription } from "@/hooks/useSubscription";
@@ -6,7 +6,7 @@ import { AuthForm } from "@/components/AuthForm";
 import { Dashboard } from "@/components/Dashboard";
 import { PricingTable } from "@/components/PricingTable";
 import { CheckoutModal } from "@/components/CheckoutModal";
-import { Alert, Button, Spinner } from "@/components/ui";
+import { Alert, Button, Card, Spinner } from "@/components/ui";
 
 /**
  * Plan copy lives in the frontend; prices live in Stripe. Only priceId crosses
@@ -71,31 +71,17 @@ function Shell() {
   const { user, isAuthenticated, isBootstrapping, logout } = useAuth();
 
   return (
-    <div className="min-h-dvh">
-      <header className="border-b border-line/60">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-5">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-8 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white">
-              S
-            </div>
-            <span className="font-semibold tracking-tight">Stripe Gateway</span>
-          </div>
+    <div className="mx-auto flex min-h-dvh w-full max-w-6xl flex-col gap-8 px-4 py-6 sm:px-6 sm:py-8">
+      <Header
+        {...(isAuthenticated && user
+          ? { email: user.email, onSignOut: () => void logout() }
+          : {})}
+      />
 
-          {isAuthenticated && user && (
-            <div className="flex items-center gap-4">
-              <span className="hidden text-sm text-muted sm:inline">{user.email}</span>
-              <Button variant="ghost" onClick={() => void logout()}>
-                Sign out
-              </Button>
-            </div>
-          )}
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-5xl px-6 py-10 sm:py-14">
+      <main className="flex-1">
         {isBootstrapping ? (
-          <div className="flex justify-center py-24" aria-busy="true">
-            <Spinner className="size-6 text-faint" />
+          <div className="flex justify-center py-32" aria-busy="true">
+            <Spinner className="size-6 text-gold/70" />
           </div>
         ) : isAuthenticated ? (
           <Billing />
@@ -103,7 +89,42 @@ function Shell() {
           <AuthForm />
         )}
       </main>
+
+      {isAuthenticated && <FeatureRow />}
     </div>
+  );
+}
+
+interface HeaderProps {
+  email?: string;
+  onSignOut?: () => void;
+}
+
+/**
+ * The account controls appear only when signed in. The mock shows them on the
+ * sign-in screen too, which would be a state bug rather than a style choice -
+ * there is nothing to sign out of.
+ */
+function Header({ email, onSignOut }: HeaderProps) {
+  return (
+    <Card className="flex items-center justify-between gap-4 px-5 py-4">
+      <div className="flex items-center gap-3">
+        <span className="btn-gold grid size-9 place-items-center rounded-xl font-display text-lg font-semibold">
+          S
+        </span>
+        <span className="font-semibold tracking-tight text-ink">Stripe Gateway</span>
+      </div>
+
+      {email && onSignOut && (
+        <div className="flex items-center gap-4">
+          <span className="hidden text-sm text-muted sm:inline">{email}</span>
+          <Button variant="secondary" onClick={onSignOut} className="px-5 py-2.5 text-[13px]">
+            <ArrowIcon />
+            Sign out
+          </Button>
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -136,11 +157,10 @@ function Billing() {
   const pricingVisible = showPricing || !hasSubscription;
 
   return (
-    <div className="space-y-10">
+    <div className="space-y-16">
       {returnedFromCheckout && !hasSubscription && (
         <Alert title="Finishing up" tone="info">
-          Payment received. Waiting for Stripe to confirm the subscription — this usually takes a
-          second.
+          Payment received. Waiting for Stripe to confirm the subscription — this usually takes a second.
         </Alert>
       )}
 
@@ -152,7 +172,7 @@ function Billing() {
       />
 
       {hasSubscription && (
-        <div className="flex justify-end">
+        <div className="flex justify-center">
           <Button variant="ghost" onClick={() => setShowPricing((v) => !v)}>
             {showPricing ? "Hide plans" : "Change plan"}
           </Button>
@@ -174,5 +194,75 @@ function Billing() {
 
       {checkoutSecret && <CheckoutModal clientSecret={checkoutSecret} onClose={closeCheckout} />}
     </div>
+  );
+}
+
+const FEATURES: Array<{ icon: ReactNode; title: string; body: string }> = [
+  { icon: <LockGlyph />, title: "Built for developers", body: "Powerful APIs and SDKs" },
+  { icon: <GlobeGlyph />, title: "Secure by default", body: "Enterprise-grade security" },
+  { icon: <ChartGlyph />, title: "Reliable infrastructure", body: "99.95% uptime SLA" },
+  { icon: <HeartGlyph />, title: "Here to help", body: "Support when you need it" },
+];
+
+function FeatureRow() {
+  return (
+    <Card className="grid gap-7 px-7 py-7 sm:grid-cols-2 lg:grid-cols-4">
+      {FEATURES.map((feature) => (
+        <div key={feature.title} className="flex items-center gap-4">
+          <span className="chip size-11 shrink-0 text-gold">{feature.icon}</span>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-ink">{feature.title}</p>
+            <p className="mt-0.5 text-[13px] text-muted">{feature.body}</p>
+          </div>
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+/* --- glyphs ---------------------------------------------------------------- */
+
+function LockGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-[18px]" aria-hidden="true">
+      <rect x="4" y="10" width="16" height="11" rx="3" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M8 10V7a4 4 0 1 1 8 0v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function GlobeGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-[18px]" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" stroke="currentColor" strokeWidth="1.7" />
+    </svg>
+  );
+}
+
+function ChartGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-[18px]" aria-hidden="true">
+      <path d="M5 20V11M12 20V5m7 15v-6" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function HeartGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-[18px]" aria-hidden="true">
+      <path
+        d="M12 20.2 4.3 12.7a4.6 4.6 0 0 1 6.5-6.5l1.2 1.2 1.2-1.2a4.6 4.6 0 1 1 6.5 6.5L12 20.2Z"
+        stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function ArrowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-4" aria-hidden="true">
+      <path d="M5 12h13m0 0-5-5m5 5-5 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   );
 }

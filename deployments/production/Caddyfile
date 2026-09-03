@@ -29,7 +29,11 @@
 
 		# The API returns JSON and the UI loads Stripe's embedded checkout,
 		# which needs its script and frame origins allowed.
-		Content-Security-Policy "default-src 'self'; script-src 'self' https://js.stripe.com; frame-src https://js.stripe.com https://hooks.stripe.com; connect-src 'self' https://api.stripe.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'"
+		# style-src and font-src carry the Google Fonts origins because the UI
+		# loads Playfair Display and Inter from there. Without them the fonts
+		# are blocked silently and the page falls back to system serif - which
+		# looks like a design bug rather than a policy one.
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://js.stripe.com; frame-src https://js.stripe.com https://hooks.stripe.com; connect-src 'self' https://api.stripe.com; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; base-uri 'none'; form-action 'self'"
 
 		# Caddy's own version is not information anyone needs.
 		-Server
