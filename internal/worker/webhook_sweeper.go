@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 )
@@ -94,9 +95,22 @@ func (c SweeperConfig) withDefaults() SweeperConfig {
 // rather than block on each other.
 type WebhookSweeper struct {
 	hooks   repo.WebhookRepository
+	subs    repo.SubscriptionRepository
 	webhook *service.WebhookService
+	metrics *metrics.Registry
 	cfg     SweeperConfig
 	log     *slog.Logger
+}
+
+// WithMetrics publishes the ledger and dunning gauges on every sweep.
+//
+// Gauges rather than a scrape-time query: a collector that hits the database on
+// every scrape turns a monitoring system into a load generator, and a slow
+// query stalls the scrape rather than the request path. The sweep already runs
+// on a schedule, so it is the natural place to sample.
+func (s *WebhookSweeper) WithMetrics(m *metrics.Registry, subs repo.SubscriptionRepository) *WebhookSweeper {
+	s.metrics, s.subs = m, subs
+	return s
 }
 
 func NewWebhookSweeper(
@@ -228,6 +242,18 @@ func (s *WebhookSweeper) report(ctx context.Context) repo.LedgerStats {
 		s.log.ErrorContext(ctx, "could not read ledger stats", slog.String("error", err.Error()))
 		return stats
 	}
+	if s.metrics != nil {
+		s.metrics.SetLedger(stats.Processing, stats.Retryable, stats.DeadLettered)
+		if s.subs != nil {
+			if n, err := s.subs.CountInDunning(ctx); err == nil {
+				s.metrics.SetDunning(n)
+			} else {
+				s.log.WarnContext(ctx, "could not read the dunning count",
+					slog.String("error", err.Error()))
+			}
+		}
+	}
+
 	if stats.Unsettled() == 0 {
 		s.log.DebugContext(ctx, "webhook ledger is clean")
 		return stats

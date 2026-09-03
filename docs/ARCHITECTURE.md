@@ -605,6 +605,72 @@ independently, and the sweeper's claim-level attempts guard survives being
 neutered because the race window is narrower than it looks. Both guards stay;
 neither is claimed as proven.
 
+## Metrics
+
+Prometheus instruments live in `internal/metrics`, on a registry built there
+rather than `prometheus.DefaultRegisterer` — so nothing can register a metric
+into this process by importing a library, and a test can build a second one
+without collector-already-registered panics.
+
+### The route label is the pattern, never the path
+
+`middleware.Metrics` labels by chi's matched route pattern. A raw path creates
+one time series per distinct URL, which with an id in the path is unbounded —
+and an unbounded label is how a metrics endpoint takes down the process it was
+added to observe. Unmatched requests collapse to `route=unmatched`, so nobody
+can mint time series by requesting random URLs.
+
+`TestMetricsLabelsByRoutePatternNotPath` fails if that regresses.
+
+One chi behaviour worth knowing: a router with **no routes registered** skips
+its middleware chain entirely. No real router is in that state, but a test
+written without a route silently observes nothing — which is how the first
+version of the unmatched-route test passed while measuring nothing.
+
+### /metrics is not on the public router
+
+It is served by `handler.NewAdminRouter` on a second listener, `METRICS_PORT`.
+The endpoint publishes request rates, error counts, in-flight concurrency and
+business volume — how many subscriptions, how many payments failed, how many
+events are stuck. That is a map of the system for anyone probing it and a free
+traffic-analysis feed for a competitor.
+
+Keeping it off the public router means it cannot be reached by adding a path,
+only by reaching a port the reverse proxy never exposes. Config refuses to start
+if `METRICS_PORT` equals `HTTP_PORT`.
+
+### Gauges are sampled by the workers, not at scrape time
+
+The ledger, dunning and retention gauges are published by the sweeper and the
+retention worker on their existing schedules. A collector that queried the
+database on every scrape would turn the monitoring system into a load generator,
+and a slow query would stall the scrape rather than the request path.
+
+### Labels that would leak
+
+Webhook signature failures are labelled `event_type="unverified"` rather than by
+the type in the body — the body is not trustworthy until the signature checks
+out, and an attacker choosing label values is unbounded cardinality by another
+route.
+
+Login counts use one `failed` outcome for both an unknown account and a wrong
+password. Separating them would be the same enumeration oracle the login path
+avoids, just read off a dashboard instead of a response.
+
+### The four alerts worth having
+
+Written down in `deployments/production/prometheus.yml` rather than implemented,
+since there is no Alertmanager yet:
+
+- `sps_webhook_ledger_unsettled{state="dead_lettered"} > 0` — money-affecting
+  events are not being applied and nothing will fix it without a human
+- `rate(sps_auth_token_refreshes_total{outcome="reuse_detected"}[15m]) > 0` — a
+  refresh token was replayed
+- `sps_retention_payloads_past_window > 0 for 1h` — personal data kept past its
+  window
+- p99 of `/webhook` above 10s — approaching Stripe's timeout, past which it
+  retries deliveries that actually succeeded
+
 ## Query contracts the repository layer must honour
 
 Partial indices are the reason the hot paths stay fast at scale, but two of them

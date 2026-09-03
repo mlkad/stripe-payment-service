@@ -1,0 +1,40 @@
+# Prometheus for a single VPS. Scrapes the API's metrics listener over the
+# internal compose network; nothing here is reachable from the internet.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    service: stripe-payment-service
+
+scrape_configs:
+  - job_name: api
+    # The metrics listener, not the public port. It is not published to the
+    # host, so this is the only way to reach it.
+    static_configs:
+      - targets: ["api:9091"]
+        labels:
+          instance: api
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+# Alerting rules worth adding once an Alertmanager exists. Written down here
+# because these are the four conditions that actually matter for this service:
+#
+#   sps_webhook_ledger_unsettled{state="dead_lettered"} > 0
+#     Retries are exhausted. Money-affecting events are not being applied and
+#     nothing will fix it without a human.
+#
+#   rate(sps_auth_token_refreshes_total{outcome="reuse_detected"}[15m]) > 0
+#     A refresh token was replayed. Either a credential was stolen or a client
+#     is refreshing concurrently without deduping.
+#
+#   sps_retention_payloads_past_window > 0 for 1h
+#     Personal data is being kept past its retention window. A compliance gap,
+#     not a performance one.
+#
+#   histogram_quantile(0.99, rate(sps_http_request_duration_seconds_bucket{route="/webhook"}[5m])) > 10
+#     Webhook processing is approaching Stripe's timeout. Past it, Stripe
+#     retries deliveries that actually succeeded.
