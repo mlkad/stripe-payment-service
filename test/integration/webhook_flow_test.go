@@ -22,6 +22,7 @@ import (
 	"github.com/mlkad/stripe-payment-service/internal/domain"
 	"github.com/mlkad/stripe-payment-service/internal/handler"
 	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 	"github.com/mlkad/stripe-payment-service/internal/service"
 	paystripe "github.com/mlkad/stripe-payment-service/internal/stripe"
@@ -82,8 +83,9 @@ func newWebhookStack(t *testing.T) (*service.WebhookService, http.Handler) {
 		handler.NewAuthHandler(authService, handler.CookieConfig{}, log),
 		handler.NewHealthHandler(stubProbe{}, log, "test"),
 		handler.RouterConfig{
-			CORS:   middleware.CORSConfig{AllowedOrigins: []string{"http://localhost:5173"}},
-			Tokens: testTokens(t),
+			CORS:    middleware.CORSConfig{AllowedOrigins: []string{"http://localhost:5173"}},
+			Tokens:  testTokens(t),
+			Metrics: metrics.New(),
 		},
 		log,
 	)

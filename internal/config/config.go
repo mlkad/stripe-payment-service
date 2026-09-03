@@ -148,10 +148,29 @@ type HTTP struct {
 	// AuthRateLimit throttles the credential endpoints.
 	AuthRateLimitRPS   float64
 	AuthRateLimitBurst int
+
+	// MetricsPort serves /metrics on its own listener. It must never be
+	// published past the reverse proxy: the endpoint publishes request rates,
+	// error counts and business volume, which is a map of the system for
+	// anyone probing it. Zero disables metrics entirely.
+	MetricsPort int
+
+	// MetricsBindAddress restricts the metrics listener. Empty binds every
+	// interface, which on a single VPS means the internet unless a firewall
+	// says otherwise; 127.0.0.1 is the safe choice outside a container network.
+	MetricsBindAddress string
 }
 
 // Addr renders the listen address for net/http.
 func (h HTTP) Addr() string { return ":" + strconv.Itoa(h.Port) }
+
+// MetricsAddr renders the metrics listen address. Empty when metrics are off.
+func (h HTTP) MetricsAddr() string {
+	if h.MetricsPort == 0 {
+		return ""
+	}
+	return h.MetricsBindAddress + ":" + strconv.Itoa(h.MetricsPort)
+}
 
 type Database struct {
 	// DSN is secret: libpq connection strings carry the password inline.
@@ -299,6 +318,8 @@ func Load() (*Config, error) {
 			TrustedProxies:     l.intVal("TRUSTED_PROXIES", 0),
 			AuthRateLimitRPS:   l.float("AUTH_RATE_LIMIT_RPS", 0.2),
 			AuthRateLimitBurst: l.intVal("AUTH_RATE_LIMIT_BURST", 5),
+			MetricsPort:        l.intVal("METRICS_PORT", 9091),
+			MetricsBindAddress: l.str("METRICS_BIND_ADDRESS", ""),
 		},
 		Database: Database{
 			DSN:                Secret(l.required("DATABASE_URL")),
@@ -402,6 +423,15 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.AuthRateLimitRPS <= 0 {
 		add("AUTH_RATE_LIMIT_RPS must be positive")
+	}
+	if c.HTTP.MetricsPort != 0 {
+		if c.HTTP.MetricsPort < 1 || c.HTTP.MetricsPort > 65535 {
+			add("METRICS_PORT must be 0 (disabled) or between 1 and 65535 (got %d)", c.HTTP.MetricsPort)
+		}
+		if c.HTTP.MetricsPort == c.HTTP.Port {
+			add("METRICS_PORT (%d) must differ from HTTP_PORT; sharing the port would "+
+				"put /metrics on the public API", c.HTTP.MetricsPort)
+		}
 	}
 	if c.HTTP.AuthRateLimitBurst < 1 {
 		add("AUTH_RATE_LIMIT_BURST must be at least 1 (got %d)", c.HTTP.AuthRateLimitBurst)

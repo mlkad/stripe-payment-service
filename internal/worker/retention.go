@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 )
 
@@ -85,10 +86,18 @@ func (c RetentionConfig) query(limit int) repo.PurgeQuery {
 // 30-day window does not care about minutes, and coupling them would mean
 // either pointless churn or a sluggish sweeper.
 type RetentionWorker struct {
-	hooks  repo.WebhookRepository
-	tokens repo.RefreshTokenRepository
-	cfg    RetentionConfig
-	log    *slog.Logger
+	hooks   repo.WebhookRepository
+	tokens  repo.RefreshTokenRepository
+	metrics *metrics.Registry
+	cfg     RetentionConfig
+	log     *slog.Logger
+}
+
+// WithMetrics publishes how much personal data is still held past its window.
+// A sustained non-zero value is a compliance gap, not a performance one.
+func (w *RetentionWorker) WithMetrics(m *metrics.Registry) *RetentionWorker {
+	w.metrics = m
+	return w
 }
 
 // NewRetentionWorker builds the worker. tokens may be nil, in which case
@@ -216,6 +225,10 @@ func (w *RetentionWorker) report(ctx context.Context) {
 	if err != nil {
 		w.log.ErrorContext(ctx, "could not read retention stats", slog.String("error", err.Error()))
 		return
+	}
+
+	if w.metrics != nil {
+		w.metrics.SetPayloadsPastWindow(stats.DueNow)
 	}
 
 	attrs := []any{
