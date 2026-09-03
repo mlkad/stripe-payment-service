@@ -28,3 +28,9 @@ web/*.tsbuildinfo
 
 # Production secrets
 .env.production
+
+# Stray screenshots and scratch files
+*.png
+*.jpg
+*.jpeg
+!web/public/**
