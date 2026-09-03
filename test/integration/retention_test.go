@@ -20,7 +20,8 @@ import (
 func newRetention(t *testing.T, cfg worker.RetentionConfig) *worker.RetentionWorker {
 	t.Helper()
 	return worker.NewRetentionWorker(
-		repo.NewWebhookRepo(pool, 5*time.Minute), cfg,
+		repo.NewWebhookRepo(pool, 5*time.Minute),
+		repo.NewRefreshTokenRepo(pool), cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 

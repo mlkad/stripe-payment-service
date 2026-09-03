@@ -1,7 +1,5 @@
 import type { AuthResponse, User } from "@/api/types";
 
-const STORAGE_KEY = "sps.session";
-
 export interface Session {
   token: string;
   expiresAt: string;
@@ -9,66 +7,66 @@ export interface Session {
 }
 
 /**
- * Token storage.
+ * Access token storage — in memory only.
  *
- * localStorage is readable by any script on the origin, so a single XSS is a
- * stolen credential. An httpOnly cookie would remove that, at the cost of
- * needing CSRF protection and a same-site deployment, and the backend issues a
- * bearer token for the Authorization header rather than setting a cookie.
+ * It is never written to localStorage, so a script that runs on this origin
+ * cannot read it out of storage, and it does not survive a reload. The refresh
+ * cookie restores the session instead.
  *
- * What makes this acceptable rather than merely convenient: the token is short
- * lived (one hour by default), carries no privileges beyond the subject, and
- * the API rejects anything else the token could be pointed at. It is not
- * acceptable indefinitely - the upgrade is a refresh token in an httpOnly
- * cookie with the access token held in memory only.
+ * The refresh token is not here at all: it lives in an httpOnly cookie the
+ * browser attaches to /api/v1/auth only, so script cannot read it even during
+ * an XSS. That is the point of the split — the token script can reach expires
+ * in minutes, and the one that lasts a month is unreachable.
+ *
+ * The cost is a flash of the signed-out shell on reload while the refresh call
+ * completes. `hadSession` trades a single non-sensitive bit of localStorage for
+ * avoiding that: it says a session probably exists, so the UI can wait rather
+ * than render the login form and then replace it.
  */
-export const session = {
-  load(): Session | null {
-    let raw: string | null;
-    try {
-      raw = localStorage.getItem(STORAGE_KEY);
-    } catch {
-      // Private mode, or storage disabled entirely.
-      return null;
-    }
-    if (!raw) return null;
+const HINT_KEY = "sps.session_hint";
 
-    try {
-      const parsed = JSON.parse(raw) as Session;
-      if (!parsed.token || !parsed.user?.id) return null;
-      // Drop a token that has already expired rather than sending it and
-      // taking a 401 on first paint.
-      if (Date.parse(parsed.expiresAt) <= Date.now()) {
-        session.clear();
-        return null;
-      }
-      return parsed;
-    } catch {
-      session.clear();
-      return null;
-    }
+let current: Session | null = null;
+
+export const session = {
+  get(): Session | null {
+    return current;
   },
 
-  save(response: AuthResponse): Session {
-    const value: Session = {
+  set(response: AuthResponse): Session {
+    current = {
       token: response.token,
       expiresAt: response.expires_at,
       user: response.user,
     };
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+      localStorage.setItem(HINT_KEY, "1");
     } catch {
-      // Storage failures must not block sign-in; the session simply does not
-      // survive a reload.
+      // Private mode, or storage disabled. Only costs the reload flash.
     }
-    return value;
+    return current;
   },
 
   clear(): void {
+    current = null;
     try {
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(HINT_KEY);
     } catch {
       /* nothing to do */
     }
+  },
+
+  /** Whether a session probably exists, for deciding what to render on load. */
+  hadSession(): boolean {
+    try {
+      return localStorage.getItem(HINT_KEY) === "1";
+    } catch {
+      return false;
+    }
+  },
+
+  /** True when the access token is within `skewMs` of expiring. */
+  isExpiring(skewMs = 30_000): boolean {
+    if (!current) return true;
+    return Date.parse(current.expiresAt) - Date.now() <= skewMs;
   },
 };

@@ -179,7 +179,9 @@ func run() error {
 	}
 
 	subscriptionService := service.NewSubscriptionService(subRepo, log)
-	authService := service.NewAuthService(userRepo, hasher, tokens, log)
+	refreshRepo := postgres.NewRefreshTokenRepo(db.Pool())
+	authService := service.NewAuthService(
+		userRepo, refreshRepo, hasher, tokens, cfg.Auth.RefreshTokenTTL, log)
 
 	authRateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
 		Rate:  cfg.HTTP.AuthRateLimitRPS,
@@ -188,7 +190,7 @@ func run() error {
 	defer authRateLimiter.Close()
 
 	if cfg.Retention.Enabled {
-		retention := worker.NewRetentionWorker(webhookRepo, retentionConfig(cfg), log)
+		retention := worker.NewRetentionWorker(webhookRepo, refreshRepo, retentionConfig(cfg), log)
 		go retention.Run(signalCtx)
 	} else {
 		log.Warn("payload retention is disabled; stored webhook payloads keep customer " +
@@ -206,7 +208,10 @@ func run() error {
 
 	stripeHandler := handler.NewStripeHandler(webhookService, checkoutService, log)
 	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, log)
-	authHandler := handler.NewAuthHandler(authService, log)
+	authHandler := handler.NewAuthHandler(authService, handler.CookieConfig{
+		Secure: cfg.Auth.CookieSecure,
+		Domain: cfg.Auth.CookieDomain,
+	}, log)
 	healthHandler := handler.NewHealthHandler(db, log, version)
 
 	srv := &http.Server{
@@ -292,10 +297,11 @@ func sweeperConfig(cfg *config.Config) worker.SweeperConfig {
 
 func retentionConfig(cfg *config.Config) worker.RetentionConfig {
 	return worker.RetentionConfig{
-		Interval:       cfg.Retention.Interval,
-		SettledAfter:   cfg.Retention.SettledPayloadAfter,
-		UnsettledAfter: cfg.Retention.UnsettledPayloadAfter,
-		BatchSize:      cfg.Retention.BatchSize,
+		Interval:          cfg.Retention.Interval,
+		SettledAfter:      cfg.Retention.SettledPayloadAfter,
+		UnsettledAfter:    cfg.Retention.UnsettledPayloadAfter,
+		BatchSize:         cfg.Retention.BatchSize,
+		RefreshTokenGrace: cfg.Retention.RefreshTokenGrace,
 	}
 }
 
@@ -332,6 +338,7 @@ func runRetentionTool() error {
 
 	w := worker.NewRetentionWorker(
 		postgres.NewWebhookRepo(db.Pool(), cfg.Sweeper.StaleClaimAfter),
+		postgres.NewRefreshTokenRepo(db.Pool()),
 		retentionConfig(cfg), log)
 
 	result := w.RunOnce(ctx)

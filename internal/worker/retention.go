@@ -24,6 +24,12 @@ type RetentionConfig struct {
 	// BatchSize bounds one pass, so a large first run is spread over several
 	// rather than holding one long transaction against the hot table.
 	BatchSize int
+
+	// RefreshTokenGrace is how long an expired refresh token is kept before
+	// deletion. Not zero: reuse detection has to still fire on a token that
+	// expired between being stolen and being used, and a deleted row detects
+	// nothing.
+	RefreshTokenGrace time.Duration
 }
 
 const (
@@ -31,6 +37,7 @@ const (
 	defaultSettledAfter      = 30 * 24 * time.Hour
 	defaultUnsettledAfter    = 90 * 24 * time.Hour
 	defaultRetentionBatch    = 500
+	defaultRefreshTokenGrace = 7 * 24 * time.Hour
 )
 
 func (c RetentionConfig) withDefaults() RetentionConfig {
@@ -45,6 +52,9 @@ func (c RetentionConfig) withDefaults() RetentionConfig {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = defaultRetentionBatch
+	}
+	if c.RefreshTokenGrace <= 0 {
+		c.RefreshTokenGrace = defaultRefreshTokenGrace
 	}
 	return c
 }
@@ -75,16 +85,26 @@ func (c RetentionConfig) query(limit int) repo.PurgeQuery {
 // 30-day window does not care about minutes, and coupling them would mean
 // either pointless churn or a sluggish sweeper.
 type RetentionWorker struct {
-	hooks repo.WebhookRepository
-	cfg   RetentionConfig
-	log   *slog.Logger
+	hooks  repo.WebhookRepository
+	tokens repo.RefreshTokenRepository
+	cfg    RetentionConfig
+	log    *slog.Logger
 }
 
-func NewRetentionWorker(hooks repo.WebhookRepository, cfg RetentionConfig, log *slog.Logger) *RetentionWorker {
+// NewRetentionWorker builds the worker. tokens may be nil, in which case
+// refresh token cleanup is skipped - useful for the CLI, which has no reason to
+// touch the auth tables.
+func NewRetentionWorker(
+	hooks repo.WebhookRepository,
+	tokens repo.RefreshTokenRepository,
+	cfg RetentionConfig,
+	log *slog.Logger,
+) *RetentionWorker {
 	return &RetentionWorker{
-		hooks: hooks,
-		cfg:   cfg.withDefaults(),
-		log:   log.With(slog.String("component", "payload_retention")),
+		hooks:  hooks,
+		tokens: tokens,
+		cfg:    cfg.withDefaults(),
+		log:    log.With(slog.String("component", "payload_retention")),
 	}
 }
 
@@ -155,8 +175,40 @@ func (w *RetentionWorker) RunOnce(ctx context.Context) repo.PurgeResult {
 			slog.String("bound", w.cfg.UnsettledAfter.String()))
 	}
 
+	w.pruneRefreshTokens(ctx)
 	w.report(ctx)
 	return total
+}
+
+// pruneRefreshTokens deletes tokens nothing can use again.
+//
+// Deleted rather than minimised, unlike webhook payloads: an expired refresh
+// token is not an audit record, and its family and timing are behavioural data
+// with no remaining purpose. Keeping it would be collecting for its own sake,
+// which is the thing data minimisation is against.
+func (w *RetentionWorker) pruneRefreshTokens(ctx context.Context) {
+	if w.tokens == nil {
+		return
+	}
+	var total int64
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		deleted, err := w.tokens.DeleteExpiredRefreshTokens(ctx, w.cfg.RefreshTokenGrace, w.cfg.BatchSize)
+		if err != nil {
+			w.log.ErrorContext(ctx, "could not prune expired refresh tokens",
+				slog.String("error", err.Error()))
+			return
+		}
+		total += deleted
+		if int(deleted) < w.cfg.BatchSize {
+			break
+		}
+	}
+	if total > 0 {
+		w.log.InfoContext(ctx, "expired refresh tokens pruned", slog.Int64("count", total))
+	}
 }
 
 func (w *RetentionWorker) report(ctx context.Context) {
