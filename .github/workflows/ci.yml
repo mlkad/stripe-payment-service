@@ -72,18 +72,21 @@ jobs:
         env:
           POSTGRES_USER: payments
           POSTGRES_PASSWORD: ci_password
-          POSTGRES_DB: payments
+          # Named as a test database on purpose: the suite TRUNCATEs every
+          # table between cases and refuses to run against anything not
+          # obviously disposable.
+          POSTGRES_DB: payments_test
         ports: ["5432:5432"]
         # The job must not start querying before the server accepts
         # connections; without this the first test races the container.
         options: >-
-          --health-cmd "pg_isready -U payments -d payments"
+          --health-cmd "pg_isready -U payments -d payments_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
 
     env:
-      TEST_DATABASE_URL: postgres://payments:ci_password@localhost:5432/payments?sslmode=disable
+      TEST_DATABASE_URL: postgres://payments:ci_password@localhost:5432/payments_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v7
