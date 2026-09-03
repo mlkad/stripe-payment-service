@@ -7,6 +7,10 @@ Calling the Stripe API is the easy part. This is about the rest: webhooks
 arriving twice, arriving out of order, arriving three days late, and what
 happens when a payment fails at 3am.
 
+![Dashboard and pricing](docs/screenshots/dashboard.png)
+
+![Sign in](docs/screenshots/sign-in.png)
+
 **Go 1.25 · PostgreSQL 16 · pgx/v5 · chi · React 19 · Vite · Tailwind 4**
 
 Modular monolith. One binary, one database, workers as goroutines. The
