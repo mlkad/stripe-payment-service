@@ -29,8 +29,10 @@ web/*.tsbuildinfo
 # Production secrets
 .env.production
 
-# Stray screenshots and scratch files
+# Stray screenshots dropped in the working tree. Deliberate images live in
+# docs/screenshots and web/public, so those are excluded from the rule.
 *.png
 *.jpg
 *.jpeg
+!docs/screenshots/**
 !web/public/**
