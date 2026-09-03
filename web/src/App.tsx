@@ -84,7 +84,7 @@ function Shell() {
           {isAuthenticated && user && (
             <div className="flex items-center gap-4">
               <span className="hidden text-sm text-muted sm:inline">{user.email}</span>
-              <Button variant="ghost" onClick={logout}>
+              <Button variant="ghost" onClick={() => void logout()}>
                 Sign out
               </Button>
             </div>

@@ -21,6 +21,11 @@ type AuthResult struct {
 	Token     string
 	ExpiresAt time.Time
 	User      *UserView
+
+	// RefreshToken is returned once, in plaintext, for the handler to put in an
+	// httpOnly cookie. It is never stored in that form and never logged.
+	RefreshToken          string
+	RefreshTokenExpiresAt time.Time
 }
 
 // UserView is the read model for an identity. domain.User carries the password
@@ -36,14 +41,29 @@ func viewOf(u *domain.User) *UserView {
 }
 
 type AuthService struct {
-	users  repo.UserRepository
-	hasher *auth.Hasher
-	tokens *auth.TokenService
-	log    *slog.Logger
+	users      repo.UserRepository
+	refresh    repo.RefreshTokenRepository
+	hasher     *auth.Hasher
+	tokens     *auth.TokenService
+	log        *slog.Logger
+	refreshTTL time.Duration
 }
 
-func NewAuthService(users repo.UserRepository, hasher *auth.Hasher, tokens *auth.TokenService, log *slog.Logger) *AuthService {
-	return &AuthService{users: users, hasher: hasher, tokens: tokens, log: log}
+func NewAuthService(
+	users repo.UserRepository,
+	refresh repo.RefreshTokenRepository,
+	hasher *auth.Hasher,
+	tokens *auth.TokenService,
+	refreshTTL time.Duration,
+	log *slog.Logger,
+) *AuthService {
+	if refreshTTL <= 0 {
+		refreshTTL = 30 * 24 * time.Hour
+	}
+	return &AuthService{
+		users: users, refresh: refresh, hasher: hasher,
+		tokens: tokens, refreshTTL: refreshTTL, log: log,
+	}
 }
 
 // Register creates an identity and returns a token for it.
@@ -74,7 +94,7 @@ func (s *AuthService) Register(ctx context.Context, email, password string, full
 	}
 
 	s.log.InfoContext(ctx, "user registered", slog.String("user_id", user.ID.String()))
-	return s.issue(user)
+	return s.issue(ctx, user)
 }
 
 // Login verifies credentials.
@@ -115,7 +135,7 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (*AuthR
 		}
 	}
 
-	return s.issue(user)
+	return s.issue(ctx, user)
 }
 
 // Me returns the identity behind a token, for the frontend to bootstrap with.
@@ -130,10 +150,126 @@ func (s *AuthService) Me(ctx context.Context, userID uuid.UUID) (*UserView, erro
 	return viewOf(user), nil
 }
 
-func (s *AuthService) issue(user *domain.User) (*AuthResult, error) {
-	token, expiresAt, err := s.tokens.Issue(user.ID, user.Email)
+// Refresh exchanges a refresh token for a new access token and a successor.
+//
+// Rotation is unconditional: every renewal consumes the presented token, so a
+// leaked one is useful only until the legitimate client next refreshes. If a
+// consumed token comes back, the repository revokes the whole family and this
+// returns domain.ErrTokenReused - the caller has to sign in again, and so does
+// whoever stole it.
+func (s *AuthService) Refresh(ctx context.Context, presented string) (*AuthResult, error) {
+	if presented == "" {
+		return nil, domain.ErrNotFound
+	}
+
+	successorToken, successorHash, err := auth.NewRefreshToken()
+	if err != nil {
+		return nil, fmt.Errorf("mint refresh token: %w", err)
+	}
+
+	stored, err := s.refresh.ConsumeRefreshToken(ctx, repo.ConsumeRefreshToken{
+		PresentedHash:      auth.HashRefreshToken(presented),
+		SuccessorHash:      successorHash,
+		SuccessorExpiresAt: time.Now().Add(s.refreshTTL),
+	})
+	switch {
+	case errors.Is(err, domain.ErrTokenReused):
+		// Worth an error line: this is either a stolen credential or a client
+		// bug that will keep ending sessions, and both need looking at.
+		s.log.ErrorContext(ctx, "refresh token reuse detected; revoked the session family",
+			slog.String("reason", "a token that was already exchanged was presented again"))
+		return nil, err
+	case err != nil:
+		return nil, err
+	}
+
+	user, err := s.users.GetUserByID(ctx, stored.UserID)
+	if err != nil {
+		// A valid token whose account is gone. The credential is the thing that
+		// is no longer good.
+		return nil, domain.ErrNotFound
+	}
+
+	access, expiresAt, err := s.tokens.Issue(user.ID, user.Email)
+	if err != nil {
+		return nil, fmt.Errorf("issue access token: %w", err)
+	}
+	return &AuthResult{
+		Token:                 access,
+		ExpiresAt:             expiresAt,
+		User:                  viewOf(user),
+		RefreshToken:          successorToken,
+		RefreshTokenExpiresAt: stored.ExpiresAt,
+	}, nil
+}
+
+// Logout ends the session the presented token belongs to.
+//
+// Revokes the family rather than the single token, so a logout on one device
+// cannot be undone by a successor the client already holds. Other devices keep
+// their own families and stay signed in; RevokeAllSessions is the tool for
+// ending those.
+func (s *AuthService) Logout(ctx context.Context, presented string) error {
+	if presented == "" {
+		// Nothing to revoke. Logout is idempotent by design: a client clearing
+		// a session it no longer has should not see an error.
+		return nil
+	}
+
+	revoked, err := s.refresh.RevokeFamilyByToken(ctx,
+		auth.HashRefreshToken(presented), "signed out")
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("revoke session: %w", err)
+	}
+	s.log.InfoContext(ctx, "session ended", slog.Int64("tokens_revoked", revoked))
+	return nil
+}
+
+// RevokeAllSessions ends every session for a user. The tool for a password
+// change or a compromised account.
+func (s *AuthService) RevokeAllSessions(ctx context.Context, userID uuid.UUID, reason string) error {
+	revoked, err := s.refresh.RevokeAllForUser(ctx, userID, reason)
+	if err != nil {
+		return fmt.Errorf("revoke sessions: %w", err)
+	}
+	s.log.InfoContext(ctx, "all sessions revoked",
+		slog.String("user_id", userID.String()),
+		slog.Int64("tokens_revoked", revoked),
+		slog.String("reason", reason))
+	return nil
+}
+
+func (s *AuthService) issue(ctx context.Context, user *domain.User) (*AuthResult, error) {
+	access, expiresAt, err := s.tokens.Issue(user.ID, user.Email)
 	if err != nil {
 		return nil, fmt.Errorf("issue token: %w", err)
 	}
-	return &AuthResult{Token: token, ExpiresAt: expiresAt, User: viewOf(user)}, nil
+
+	refreshToken, refreshHash, err := auth.NewRefreshToken()
+	if err != nil {
+		return nil, fmt.Errorf("mint refresh token: %w", err)
+	}
+
+	// A fresh login starts a new family. Sessions on other devices are
+	// untouched, so signing in here does not sign out there.
+	record := &domain.RefreshToken{
+		UserID:    user.ID,
+		TokenHash: refreshHash,
+		FamilyID:  uuid.New(),
+		ExpiresAt: time.Now().Add(s.refreshTTL),
+	}
+	if err := s.refresh.CreateRefreshToken(ctx, record); err != nil {
+		return nil, fmt.Errorf("store refresh token: %w", err)
+	}
+
+	return &AuthResult{
+		Token:                 access,
+		ExpiresAt:             expiresAt,
+		User:                  viewOf(user),
+		RefreshToken:          refreshToken,
+		RefreshTokenExpiresAt: record.ExpiresAt,
+	}, nil
 }

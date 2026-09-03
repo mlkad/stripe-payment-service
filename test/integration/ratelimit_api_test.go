@@ -62,7 +62,8 @@ func throttledStack(t *testing.T, burst int) http.Handler {
 		handler.NewSubscriptionHandler(
 			service.NewSubscriptionService(repo.NewSubscriptionRepo(pool), log), log),
 		handler.NewAuthHandler(
-			service.NewAuthService(userRepo, testHasher(t), testTokens(t), log), log),
+			service.NewAuthService(userRepo, repo.NewRefreshTokenRepo(pool), testHasher(t), testTokens(t), 30*24*time.Hour, log),
+			handler.CookieConfig{}, log),
 		handler.NewHealthHandler(stubProbe{}, log, "test"),
 		handler.RouterConfig{AuthRateLimit: limiter, Tokens: testTokens(t)},
 		log,

@@ -96,6 +96,19 @@ type Auth struct {
 	// short rather than a reason to be relaxed about it.
 	AccessTokenTTL time.Duration
 
+	// RefreshTokenTTL is how long a session survives without renewal. Long,
+	// because the refresh token is revocable - which is what makes a short
+	// access token affordable.
+	RefreshTokenTTL time.Duration
+
+	// CookieSecure marks the refresh cookie Secure. False only for plain-HTTP
+	// local development; a refresh token over HTTP is readable in transit.
+	CookieSecure bool
+
+	// CookieDomain is empty for a host-only cookie, which is the safer default:
+	// a domain cookie reaches every subdomain.
+	CookieDomain string
+
 	BcryptCost int
 }
 
@@ -217,6 +230,11 @@ type Retention struct {
 	UnsettledPayloadAfter time.Duration
 
 	BatchSize int
+
+	// RefreshTokenGrace is how long an expired refresh token is kept before
+	// deletion, so reuse detection still fires on one that expired between
+	// theft and use.
+	RefreshTokenGrace time.Duration
 }
 
 type Log struct {
@@ -312,11 +330,17 @@ func Load() (*Config, error) {
 			AllowedPriceIDs:    l.csv("STRIPE_ALLOWED_PRICE_IDS"),
 		},
 		Auth: Auth{
-			JWTSecret:      Secret(l.required("JWT_SECRET")),
-			JWTIssuer:      l.str("JWT_ISSUER", "stripe-payment-service"),
-			JWTAudience:    l.str("JWT_AUDIENCE", "stripe-payment-service-api"),
-			AccessTokenTTL: l.duration("JWT_ACCESS_TOKEN_TTL", time.Hour),
-			BcryptCost:     l.intVal("BCRYPT_COST", 12),
+			JWTSecret:   Secret(l.required("JWT_SECRET")),
+			JWTIssuer:   l.str("JWT_ISSUER", "stripe-payment-service"),
+			JWTAudience: l.str("JWT_AUDIENCE", "stripe-payment-service-api"),
+			// Fifteen minutes rather than an hour: the access token is stateless
+			// and cannot be revoked, so its lifetime is the containment window
+			// for a stolen one. A refresh token makes that affordable.
+			AccessTokenTTL:  l.duration("JWT_ACCESS_TOKEN_TTL", 15*time.Minute),
+			RefreshTokenTTL: l.duration("REFRESH_TOKEN_TTL", 30*24*time.Hour),
+			CookieSecure:    l.boolVal("AUTH_COOKIE_SECURE", false),
+			CookieDomain:    l.str("AUTH_COOKIE_DOMAIN", ""),
+			BcryptCost:      l.intVal("BCRYPT_COST", 12),
 		},
 		Sweeper: Sweeper{
 			Enabled:         l.boolVal("WEBHOOK_SWEEPER_ENABLED", true),
@@ -334,6 +358,7 @@ func Load() (*Config, error) {
 			SettledPayloadAfter:   l.duration("PAYLOAD_RETENTION_SETTLED_AFTER", 30*24*time.Hour),
 			UnsettledPayloadAfter: l.duration("PAYLOAD_RETENTION_UNSETTLED_AFTER", 90*24*time.Hour),
 			BatchSize:             l.intVal("PAYLOAD_RETENTION_BATCH_SIZE", 500),
+			RefreshTokenGrace:     l.duration("REFRESH_TOKEN_GRACE", 7*24*time.Hour),
 		},
 		Log: Log{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
@@ -586,6 +611,22 @@ func (c *Config) validateAuth() []error {
 		// is the entire containment window for a stolen credential.
 		add("JWT_ACCESS_TOKEN_TTL is %s; tokens cannot be revoked before expiry, "+
 			"so production must not exceed 24h", ttl)
+	}
+
+	switch ttl := c.Auth.RefreshTokenTTL; {
+	case ttl <= 0:
+		add("REFRESH_TOKEN_TTL must be positive")
+	case ttl <= c.Auth.AccessTokenTTL:
+		add("REFRESH_TOKEN_TTL (%s) must exceed JWT_ACCESS_TOKEN_TTL (%s); a refresh "+
+			"token that expires first cannot renew anything",
+			ttl, c.Auth.AccessTokenTTL)
+	}
+
+	// A refresh token sent over plain HTTP is readable by anything on the path,
+	// and it is the credential that outlives every access token.
+	if c.App.Environment.IsProduction() && !c.Auth.CookieSecure {
+		add("AUTH_COOKIE_SECURE must be true in production; the refresh cookie would " +
+			"otherwise be sent over plain HTTP")
 	}
 
 	if cost := c.Auth.BcryptCost; cost < 10 || cost > 31 {
