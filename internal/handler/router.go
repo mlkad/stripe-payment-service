@@ -127,7 +127,18 @@ func NewRouter(
 			}
 			r.Post("/auth/register", authHandler.HandleRegister)
 			r.Post("/auth/login", authHandler.HandleLogin)
+
+			// Refresh is public because the caller has no valid access token -
+			// that is why they are here. The refresh cookie is the credential,
+			// and it is rate limited alongside the others: an attacker with a
+			// stolen cookie should not get unlimited renewal attempts either.
+			r.Post("/auth/refresh", authHandler.HandleRefresh)
 		})
+
+		// Logout takes no access token on purpose: a session whose access token
+		// has already expired must still be endable, or a client is left
+		// holding a live refresh token it cannot revoke.
+		r.Post("/auth/logout", authHandler.HandleLogout)
 
 		// Everything below requires a valid bearer token. The subject is read
 		// from the token inside the handlers; no route here accepts a user id

@@ -15,71 +15,98 @@ import { session, type Session } from "@/lib/session";
 interface AuthContextValue {
   user: User | null;
   isAuthenticated: boolean;
-  /** True until the stored session has been checked against the server. */
+  /** True until the stored session has been restored or ruled out. */
   isBootstrapping: boolean;
   login: (body: LoginRequest) => Promise<void>;
   register: (body: RegisterRequest) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [current, setCurrent] = useState<Session | null>(() => session.load());
-  const [isBootstrapping, setIsBootstrapping] = useState(current !== null);
+  const [current, setCurrent] = useState<Session | null>(() => session.get());
+  // A hint that a session probably exists lets the shell wait rather than
+  // render the login form and immediately replace it.
+  const [isBootstrapping, setIsBootstrapping] = useState(() => session.hadSession());
 
-  // Read through a ref so the bridge installed below never captures a stale
-  // token; it is registered once and must see the latest value.
   const sessionRef = useRef(current);
   sessionRef.current = current;
 
-  const logout = useCallback(() => {
+  const clearSession = useCallback(() => {
     session.clear();
     sessionRef.current = null;
     setCurrent(null);
   }, []);
 
-  // Installed before the first request so a restored token is attached to it.
+  // Concurrent 401s must produce one renewal, not one per request. Without
+  // this, five parallel calls would each rotate the refresh token and four
+  // would present an already-consumed one - which the server correctly reads
+  // as theft and ends the session.
+  const inFlight = useRef<Promise<boolean> | null>(null);
+
+  const renew = useCallback(async (): Promise<boolean> => {
+    if (inFlight.current) return inFlight.current;
+
+    const attempt = (async () => {
+      try {
+        const next = session.set(await api.refresh());
+        sessionRef.current = next;
+        setCurrent(next);
+        return true;
+      } catch {
+        clearSession();
+        return false;
+      } finally {
+        inFlight.current = null;
+      }
+    })();
+
+    inFlight.current = attempt;
+    return attempt;
+  }, [clearSession]);
+
+  // Installed before the first request so a renewal is available immediately.
   useEffect(() => {
     setAuthBridge({
       getToken: () => sessionRef.current?.token ?? null,
-      onUnauthorized: logout,
+      refresh: renew,
+      onUnauthorized: clearSession,
     });
-  }, [logout]);
+  }, [renew, clearSession]);
 
-  // A stored token can be expired, revoked, or issued by a server that has
-  // since rotated its secret. Confirming it once on load means the UI never
-  // renders a signed-in shell that every request then fails.
+  // The access token lives in memory, so a reload always starts without one.
+  // The refresh cookie is what restores the session.
   useEffect(() => {
-    if (!current) {
+    if (!session.hadSession()) {
       setIsBootstrapping(false);
       return;
     }
-    const controller = new AbortController();
-
-    api
-      .me(controller.signal)
-      .then((user) => setCurrent((prev) => (prev ? { ...prev, user } : prev)))
-      .catch((error: unknown) => {
-        if (error instanceof ApiError && error.isUnauthorized) logout();
-        // Any other failure is the network or the server, not the token:
-        // signing the user out over a blip would be worse than proceeding.
-      })
-      .finally(() => setIsBootstrapping(false));
-
-    return () => controller.abort();
-    // Runs once: re-running on every session change would re-verify a token
-    // that was just issued by login.
+    void renew().finally(() => setIsBootstrapping(false));
+    // Runs once on mount: re-running would renew a token login just issued.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const login = useCallback(async (body: LoginRequest) => {
-    setCurrent(session.save(await api.login(body)));
+    setCurrent(session.set(await api.login(body)));
   }, []);
 
   const register = useCallback(async (body: RegisterRequest) => {
-    setCurrent(session.save(await api.register(body)));
+    setCurrent(session.set(await api.register(body)));
   }, []);
+
+  const logout = useCallback(async () => {
+    try {
+      // Server-side first: this is what revokes the refresh family. Clearing
+      // only the client would leave a live token in the cookie jar.
+      await api.logout();
+    } catch (error) {
+      // A network failure must not trap the user in a signed-in shell.
+      if (!(error instanceof ApiError)) throw error;
+    } finally {
+      clearSession();
+    }
+  }, [clearSession]);
 
   const value = useMemo<AuthContextValue>(
     () => ({

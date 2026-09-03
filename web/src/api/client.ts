@@ -59,10 +59,17 @@ export class ApiError extends Error {
  */
 export interface AuthBridge {
   getToken: () => string | null;
+  /** Renews the access token from the refresh cookie. Resolves false when the
+   *  session is genuinely over. */
+  refresh: () => Promise<boolean>;
   onUnauthorized: () => void;
 }
 
-let bridge: AuthBridge = { getToken: () => null, onUnauthorized: () => {} };
+let bridge: AuthBridge = {
+  getToken: () => null,
+  refresh: async () => false,
+  onUnauthorized: () => {},
+};
 
 export function setAuthBridge(next: AuthBridge): void {
   bridge = next;
@@ -72,16 +79,23 @@ interface RequestOptions {
   method?: "GET" | "POST";
   body?: unknown;
   signal?: AbortSignal;
-  /** Register and login must not send a stale token. */
+  /** Register, login and refresh must not send a stale token. */
   anonymous?: boolean;
+  /** Set internally on the retry after a renewal, so a 401 cannot loop. */
+  retried?: boolean;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, signal, anonymous = false } = options;
+  const { method = "GET", body, signal, anonymous = false, retried = false } = options;
 
   // Built up rather than declared inline: exactOptionalPropertyTypes rejects
   // an explicit `undefined` where RequestInit expects the key to be absent.
-  const init: RequestInit = { method };
+  const init: RequestInit = {
+    method,
+    // The refresh cookie is httpOnly and scoped to /api/v1/auth; without this
+    // the browser never sends it, and every renewal fails.
+    credentials: "include",
+  };
   if (signal) init.signal = signal;
 
   const headers: Record<string, string> = {};
@@ -107,9 +121,18 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   const requestId = response.headers.get("X-Request-Id");
 
-  if (response.status === 401 && !anonymous) {
-    // The token is gone or no longer accepted. Clearing it here, once, keeps
-    // every caller from having to handle expiry.
+  if (response.status === 401 && !anonymous && !retried) {
+    // An expired access token is the ordinary case, not a failure: they last
+    // minutes. Renew once from the refresh cookie and replay the request, so
+    // no caller has to know that tokens expire at all.
+    //
+    // `retried` bounds this to a single attempt. Without it a server that
+    // answers 401 to everything - including refresh - would loop forever.
+    if (await bridge.refresh()) {
+      return request<T>(path, { ...options, retried: true });
+    }
+    bridge.onUnauthorized();
+  } else if (response.status === 401 && !anonymous) {
     bridge.onUnauthorized();
   }
 
@@ -180,5 +203,18 @@ export const api = {
 
   me(signal?: AbortSignal): Promise<User> {
     return request<User>("/api/v1/auth/me", signal ? { signal } : {});
+  },
+
+  /** Exchanges the refresh cookie for a new access token. */
+  refresh(): Promise<AuthResponse> {
+    return request<AuthResponse>("/api/v1/auth/refresh", {
+      method: "POST",
+      anonymous: true,
+    });
+  },
+
+  /** Ends the session server-side and clears the refresh cookie. */
+  logout(): Promise<void> {
+    return request<void>("/api/v1/auth/logout", { method: "POST", anonymous: true });
   },
 };

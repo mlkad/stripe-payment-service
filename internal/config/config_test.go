@@ -63,8 +63,14 @@ func TestLoad_ValidConfiguration(t *testing.T) {
 	if cfg.HTTP.Port != 8080 {
 		t.Errorf("port = %d, want the 8080 default", cfg.HTTP.Port)
 	}
-	if cfg.Auth.AccessTokenTTL != time.Hour {
-		t.Errorf("jwt ttl = %s, want the 1h default", cfg.Auth.AccessTokenTTL)
+	// Short by default: the access token is stateless and cannot be revoked, so
+	// its lifetime is the containment window for a stolen one. The refresh
+	// token is what makes that affordable.
+	if cfg.Auth.AccessTokenTTL != 15*time.Minute {
+		t.Errorf("jwt ttl = %s, want the 15m default", cfg.Auth.AccessTokenTTL)
+	}
+	if cfg.Auth.RefreshTokenTTL != 30*24*time.Hour {
+		t.Errorf("refresh ttl = %s, want the 30d default", cfg.Auth.RefreshTokenTTL)
 	}
 }
 
@@ -139,6 +145,7 @@ func TestValidate_StripeKeyModeMustMatchTheTier(t *testing.T) {
 				env["STRIPE_CHECKOUT_CANCEL_URL"] = "https://app.example.com/cancel"
 				env["STRIPE_CHECKOUT_RETURN_URL"] = "https://app.example.com/return"
 				env["STRIPE_PORTAL_RETURN_URL"] = "https://app.example.com/"
+				env["AUTH_COOKIE_SECURE"] = "true"
 			}
 
 			_, err := loadWith(t, env)
@@ -162,6 +169,7 @@ func TestValidate_ProductionRefusesUnsafeSettings(t *testing.T) {
 		env["STRIPE_CHECKOUT_CANCEL_URL"] = "https://app.example.com/cancel"
 		env["STRIPE_CHECKOUT_RETURN_URL"] = "https://app.example.com/return"
 		env["STRIPE_PORTAL_RETURN_URL"] = "https://app.example.com/"
+		env["AUTH_COOKIE_SECURE"] = "true"
 		for k, v := range overrides {
 			env[k] = v
 		}
@@ -523,11 +531,12 @@ func TestValidateAuth_RejectsEmptyIssuerAndAudience(t *testing.T) {
 		return &Config{
 			App: App{Environment: EnvDevelopment},
 			Auth: Auth{
-				JWTSecret:      Secret("a-secret-that-is-at-least-32-bytes-long"),
-				JWTIssuer:      "iss",
-				JWTAudience:    "aud",
-				AccessTokenTTL: time.Hour,
-				BcryptCost:     12,
+				JWTSecret:       Secret("a-secret-that-is-at-least-32-bytes-long"),
+				JWTIssuer:       "iss",
+				JWTAudience:     "aud",
+				AccessTokenTTL:  15 * time.Minute,
+				RefreshTokenTTL: 30 * 24 * time.Hour,
+				BcryptCost:      12,
 			},
 		}
 	}
@@ -601,5 +610,38 @@ func TestValidate_DatabaseURLShape(t *testing.T) {
 	env["DATABASE_URL"] = "host=localhost port=5432 user=payments dbname=payments"
 	if _, err := loadWith(t, env); err != nil {
 		t.Errorf("a libpq keyword/value DSN was rejected: %v", err)
+	}
+}
+
+// A refresh token that expires before the access token it renews cannot renew
+// anything.
+func TestValidate_RefreshTokenMustOutliveTheAccessToken(t *testing.T) {
+	msg := loadExpectingError(t, map[string]string{
+		"JWT_ACCESS_TOKEN_TTL": "1h",
+		"REFRESH_TOKEN_TTL":    "30m",
+	})
+	if !strings.Contains(msg, "REFRESH_TOKEN_TTL") {
+		t.Errorf("error does not name the setting:\n%s", msg)
+	}
+}
+
+// The refresh cookie outlives every access token, so sending it over plain
+// HTTP is the worst of the transport mistakes available.
+func TestValidate_ProductionRequiresASecureCookie(t *testing.T) {
+	env := validEnv()
+	env["APP_ENV"] = "production"
+	env["STRIPE_SECRET_KEY"] = "sk_live_abc"
+	env["DATABASE_URL"] = "postgres://u:p@db/payments?sslmode=verify-full"
+	for _, k := range []string{
+		"STRIPE_CHECKOUT_SUCCESS_URL", "STRIPE_CHECKOUT_CANCEL_URL",
+		"STRIPE_CHECKOUT_RETURN_URL", "STRIPE_PORTAL_RETURN_URL",
+	} {
+		env[k] = "https://app.example.com/x"
+	}
+	env["AUTH_COOKIE_SECURE"] = "false"
+
+	_, err := loadWith(t, env)
+	if err == nil || !strings.Contains(err.Error(), "AUTH_COOKIE_SECURE") {
+		t.Errorf("production accepted an insecure refresh cookie: %v", err)
 	}
 }
