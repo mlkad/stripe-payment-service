@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/mlkad/stripe-payment-service/internal/handler/middleware"
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 )
 
 // RouterConfig carries the deadlines the routes are mounted with.
@@ -28,6 +29,9 @@ type RouterConfig struct {
 	// TrustedProxies is how many reverse proxy hops to skip when identifying
 	// the client. See middleware.ClientKeyFunc.
 	TrustedProxies int
+
+	// Metrics records one observation per request. Nil disables instrumentation.
+	Metrics *metrics.Registry
 
 	// WebhookTimeout bounds webhook processing, and is deliberately the longer
 	// of the two: checkout.session.completed makes an outbound call to Stripe
@@ -82,6 +86,13 @@ func NewRouter(
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.AccessLog(log))
+
+	// Inside AccessLog so it observes the same status, and inside chi's routing
+	// so the route pattern is available - the label has to be the pattern, not
+	// the path, or an id in a URL becomes unbounded label cardinality.
+	if cfg.Metrics != nil {
+		r.Use(middleware.Metrics(cfg.Metrics))
+	}
 	r.Use(middleware.Recoverer(log))
 
 	// CORS goes inside Recoverer but outside routing, so a preflight for an

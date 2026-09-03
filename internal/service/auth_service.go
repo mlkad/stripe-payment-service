@@ -12,6 +12,7 @@ import (
 
 	"github.com/mlkad/stripe-payment-service/internal/auth"
 	"github.com/mlkad/stripe-payment-service/internal/domain"
+	"github.com/mlkad/stripe-payment-service/internal/metrics"
 	repo "github.com/mlkad/stripe-payment-service/internal/repository/postgres"
 )
 
@@ -47,6 +48,26 @@ type AuthService struct {
 	tokens     *auth.TokenService
 	log        *slog.Logger
 	refreshTTL time.Duration
+	metrics    *metrics.Registry
+}
+
+// WithMetrics attaches instrumentation. Optional, so the CLI and tests can
+// build the service without a registry.
+func (s *AuthService) WithMetrics(m *metrics.Registry) *AuthService {
+	s.metrics = m
+	return s
+}
+
+func (s *AuthService) countAuth(operation, outcome string) {
+	if s.metrics != nil {
+		s.metrics.IncAuth(operation, outcome)
+	}
+}
+
+func (s *AuthService) countRefresh(outcome string) {
+	if s.metrics != nil {
+		s.metrics.IncTokenRefresh(outcome)
+	}
 }
 
 func NewAuthService(
@@ -88,10 +109,13 @@ func (s *AuthService) Register(ctx context.Context, email, password string, full
 	if err := s.users.CreateUser(ctx, user); err != nil {
 		// Validation and conflict pass through untouched; the handler maps them.
 		if errors.Is(err, domain.ErrValidation) || errors.Is(err, domain.ErrConflict) {
+			s.countAuth("register", "rejected")
 			return nil, err
 		}
+		s.countAuth("register", "error")
 		return nil, fmt.Errorf("create user: %w", err)
 	}
+	s.countAuth("register", "success")
 
 	s.log.InfoContext(ctx, "user registered", slog.String("user_id", user.ID.String()))
 	return s.issue(ctx, user)
@@ -108,8 +132,13 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (*AuthR
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			s.hasher.DummyCompare()
+			// One label for both failure modes, matching the response: a metric
+			// that separated "unknown account" from "wrong password" would be
+			// the same enumeration oracle, just read off a dashboard.
+			s.countAuth("login", "failed")
 			return nil, auth.ErrCredentialsMismatch
 		}
+		s.countAuth("login", "error")
 		return nil, fmt.Errorf("look up user: %w", err)
 	}
 
@@ -119,8 +148,10 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (*AuthR
 	}
 	if err := s.hasher.Verify(digest, password); err != nil {
 		s.log.WarnContext(ctx, "failed login", slog.String("user_id", user.ID.String()))
+		s.countAuth("login", "failed")
 		return nil, auth.ErrCredentialsMismatch
 	}
+	s.countAuth("login", "success")
 
 	// Cost upgrades ride along on a successful login, which is the only moment
 	// the plaintext is available. Failure is not fatal: the user is already
@@ -174,12 +205,16 @@ func (s *AuthService) Refresh(ctx context.Context, presented string) (*AuthResul
 	})
 	switch {
 	case errors.Is(err, domain.ErrTokenReused):
+		// The signal worth alerting on: a non-zero rate here means a token was
+		// stolen, or a client is refreshing concurrently without deduping.
+		s.countRefresh("reuse_detected")
 		// Worth an error line: this is either a stolen credential or a client
 		// bug that will keep ending sessions, and both need looking at.
 		s.log.ErrorContext(ctx, "refresh token reuse detected; revoked the session family",
 			slog.String("reason", "a token that was already exchanged was presented again"))
 		return nil, err
 	case err != nil:
+		s.countRefresh("rejected")
 		return nil, err
 	}
 
@@ -194,6 +229,7 @@ func (s *AuthService) Refresh(ctx context.Context, presented string) (*AuthResul
 	if err != nil {
 		return nil, fmt.Errorf("issue access token: %w", err)
 	}
+	s.countRefresh("success")
 	return &AuthResult{
 		Token:                 access,
 		ExpiresAt:             expiresAt,

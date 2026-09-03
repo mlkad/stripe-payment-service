@@ -120,4 +120,5 @@ for secrets — the process refuses to start without `STRIPE_SECRET_KEY` and
 - [x] **Step 11** — payload retention and PII minimisation
 - [x] **Step 12** — unit test coverage, coverage gate in CI
 - [x] **Step 13** — rotating refresh tokens with reuse detection
-- [ ] **Step 14** — observability, deployment
+- [x] **Step 14** — Prometheus metrics, production Docker Compose + Caddy
+- [ ] **Step 15** — plan changes and proration
