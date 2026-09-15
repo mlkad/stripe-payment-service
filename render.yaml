@@ -1,0 +1,81 @@
+# Render Blueprint - deploys the API, its Postgres database, and a one-shot
+# migration job in a single "New Blueprint Instance" run.
+#
+# Docs: https://render.com/docs/blueprint-spec
+#
+# After the first deploy, run the "migrate" job manually once (Render does
+# not run jobs automatically): Dashboard -> stripe-payment-migrate -> Trigger Run.
+# Re-run it after every deploy that adds a new migration.
+
+databases:
+  - name: stripe-payment-db
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  # ---------------------------------------------------------------------------
+  # API - HTTP gateway
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: stripe-payment-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./deployments/docker/Dockerfile
+    dockerContext: .
+    dockerCommand: --target api
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: HTTP_PORT
+        value: "10000"
+      - key: LOG_LEVEL
+        value: info
+      - key: LOG_FORMAT
+        value: json
+      - key: SHUTDOWN_TIMEOUT
+        value: 15s
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stripe-payment-db
+          property: connectionString
+
+      - key: JWT_SECRET
+        generateValue: true
+
+      # --- Fill these in manually in the Render dashboard after deploy ---
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: STRIPE_CHECKOUT_SUCCESS_URL
+        sync: false
+      - key: STRIPE_CHECKOUT_CANCEL_URL
+        sync: false
+      - key: STRIPE_CHECKOUT_RETURN_URL
+        sync: false
+      - key: STRIPE_PORTAL_RETURN_URL
+        sync: false
+
+  # ---------------------------------------------------------------------------
+  # Migrator - one-shot job, triggered manually (or wired into a deploy hook)
+  # ---------------------------------------------------------------------------
+  - type: job
+    name: stripe-payment-migrate
+    runtime: docker
+    plan: free
+    dockerfilePath: ./deployments/docker/Dockerfile
+    dockerContext: .
+    dockerCommand: --target migrator up
+    envVars:
+      - key: GOOSE_DRIVER
+        value: postgres
+      - key: GOOSE_DBSTRING
+        fromDatabase:
+          name: stripe-payment-db
+          property: connectionString
