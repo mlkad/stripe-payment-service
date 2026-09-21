@@ -76,7 +76,8 @@ services:
   - type: web
     name: stripe-payment-web
     runtime: static
-    plan: free
+    # No "plan" field: static sites have no paid/free tier on Render, so the
+    # field itself is invalid here (unlike the docker web service above).
     rootDir: web
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
