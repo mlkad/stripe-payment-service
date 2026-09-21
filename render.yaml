@@ -69,6 +69,8 @@ services:
         sync: false
       - key: STRIPE_PORTAL_RETURN_URL
         sync: false
+      - key: STRIPE_ALLOWED_PRICE_IDS
+        sync: false
 
   # ---------------------------------------------------------------------------
   # Web - static React/Vite frontend

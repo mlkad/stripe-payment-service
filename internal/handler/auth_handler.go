@@ -50,12 +50,16 @@ func NewAuthHandler(authService *service.AuthService, cookie CookieConfig, log *
 // lives where an XSS can reach it, and this is what stops that XSS from
 // becoming permanent access.
 //
-// SameSite=Strict is what stands in for CSRF protection here. The refresh and
-// logout endpoints are state-changing and authenticated purely by this cookie,
-// so a cross-site POST would otherwise carry it. Strict means the browser does
-// not attach it to any cross-site request at all. The API's own endpoints are
-// unaffected either way, since they authenticate with a Bearer header that a
-// cross-site form cannot set.
+// SameSite=None with Secure is what stands in for CSRF protection here. The
+// refresh and logout endpoints are state-changing and authenticated purely by
+// this cookie, so a cross-site POST would otherwise carry it - Strict or Lax
+// would stop that, but the web and api deployments sit on different
+// subdomains (e.g. Render's onrender.com per-service hosts), which makes every
+// legitimate refresh a cross-site request too. None is the only setting the
+// browser will still attach cookie on, and Secure (required alongside None)
+// keeps it off plain HTTP. The API's own endpoints are unaffected either way,
+// since they authenticate with a Bearer header that a cross-site form cannot
+// set.
 func (h *AuthHandler) setRefreshCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     refreshCookieName,
@@ -66,7 +70,7 @@ func (h *AuthHandler) setRefreshCookie(w http.ResponseWriter, token string, expi
 		MaxAge:   int(time.Until(expiresAt).Seconds()),
 		HttpOnly: true,
 		Secure:   h.cookie.Secure,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteNoneMode,
 	})
 }
 
