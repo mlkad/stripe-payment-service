@@ -34,7 +34,7 @@ services:
     healthCheckPath: /healthz
     envVars:
       - key: APP_ENV
-        value: production
+        value: development
       - key: HTTP_PORT
         value: "10000"
       - key: LOG_LEVEL
@@ -68,4 +68,42 @@ services:
       - key: STRIPE_CHECKOUT_RETURN_URL
         sync: false
       - key: STRIPE_PORTAL_RETURN_URL
+        sync: false
+
+  # ---------------------------------------------------------------------------
+  # Web - static React/Vite frontend
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: stripe-payment-web
+    runtime: static
+    plan: free
+    rootDir: web
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    # SPA fallback: unknown paths (e.g. a hard refresh on a client-side route)
+    # serve index.html instead of a static 404.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # Build-time only - Vite inlines VITE_* into the JS bundle, so these must
+      # be set before "npm run build" runs, not read at request time. All of
+      # them are unknown until stripe-payment-api's own onrender.com URL
+      # exists, so fill them in manually in the Render dashboard after the
+      # first deploy, then trigger a redeploy of this service:
+      #   VITE_API_BASE_URL          -> https://stripe-payment-api.onrender.com
+      #   VITE_STRIPE_PUBLISHABLE_KEY -> same pk_... as the API's
+      #                                  STRIPE_PUBLISHABLE_KEY
+      #   VITE_PRICE_STARTER / _PRO / _SCALE -> must also be in the API's
+      #                                  STRIPE_ALLOWED_PRICE_IDS
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: VITE_PRICE_STARTER
+        sync: false
+      - key: VITE_PRICE_PRO
+        sync: false
+      - key: VITE_PRICE_SCALE
         sync: false
